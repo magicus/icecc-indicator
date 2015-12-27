@@ -183,6 +183,19 @@ if __name__ == "__main__":
     while True:
         sct.cmd_q.put(ClientCommand(ClientCommand.RECEIVE))
         reply = sct.reply_q.get(True)
+        msg_type = struct.unpack('!L', bytearray(reply.data)[:4])[0]
+        print "msg_type", msg_type
+        print msg_type
+        if msg_type == 87:
+            print "is status"
+            (host_id, str_len) = struct.unpack('!LL', bytearray(reply.data)[4:12])
+            print "host id", host_id, "str len", str_len
+            payload_str = reply.data[12:]
+            print "str:", payload_str, ":"
+            print "strlen", len(payload_str)
+        else:
+            print "is not status"
+            
         hexstr = ':'.join(x.encode('hex') for x in (reply.data))
         print(reply.type, hexstr, reply.data)
     sct.cmd_q.put(ClientCommand(ClientCommand.CLOSE))
