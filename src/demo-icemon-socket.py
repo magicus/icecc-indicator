@@ -158,6 +158,71 @@ class SocketClientThread(threading.Thread):
     def _success_reply(self, data=None):
         return ClientReply(ClientReply.SUCCESS, data)
 
+class ServerMessage(object):
+    def __init__(self, data):
+        self.data = data
+        self.values = {}
+
+    def get_int(self):
+        value = struct.unpack('!L', self.data[:4])[0]
+        self.data = self.data[4:]
+        return value
+
+    def get_string(self):
+        str_len = struct.unpack('!L', self.data[:4])[0]
+        value = self.data[4:(4+str_len-1)]
+        self.data = self.data[4+str_len:]
+        return value
+    
+    def get_timestamp(self):
+        timestamp = struct.unpack('!L', self.data[:4])[0]
+        self.data = self.data[4:]
+        value = datetime.fromtimestamp(timestamp)
+        return value
+
+    def empty(self):
+        return len(self.data) == 0
+        
+    def parse_data(self):
+        msg = self
+        msg_type = msg.get_int()
+        self.values['msg_type'] = msg_type
+
+        if msg_type == 87:
+            host_id = msg.get_int()
+            payload_str = msg.get_string()
+            assert msg.empty()
+
+            self.values['host_id'] = host_id
+            for line in payload_str.splitlines():
+                (key, value) = line.split(':', 1)
+                self.values[key] = value
+            self.values['msg_desc'] = "Status Update"
+            # Note: State:Offline means this daemon has died and the host_id should be removed.
+        elif msg_type == 86:
+            host_id = msg.get_int()
+            job_id = msg.get_int()
+            start_time = msg.get_timestamp()
+            file_name = msg.get_string()
+            assert msg.empty()
+
+            self.values.update({'host_id': host_id, 'job_id': job_id, 'start_time': start_time, 'file_name': file_name})
+            self.values['msg_desc'] = "Local Job Begin"
+        elif msg_type == 79:
+            job_id = msg.get_int()
+            assert msg.empty()
+
+            self.values['job_id'] = job_id
+            self.values['msg_desc'] = "Local Job End"
+        else:
+            print "undhandle message type:", msg_type
+            self.values['raw_data'] = reply.data
+            hexstr = ':'.join(x.encode('hex') for x in (reply.data))
+            print(reply.type, hexstr, reply.data)
+            self.values['msg_desc'] = "Unknown"
+        
+        print "values:"
+        pprint(self.values)
 
 #------------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -185,40 +250,12 @@ if __name__ == "__main__":
     while True:
         sct.cmd_q.put(ClientCommand(ClientCommand.RECEIVE))
         reply = sct.reply_q.get(True)
-        msg_type = struct.unpack('!L', bytearray(reply.data)[:4])[0]
-        payload = bytearray(reply.data)[4:]
-        if msg_type == 87:
-            (host_id, str_len) = struct.unpack('!LL', bytearray(reply.data)[4:12])
-            payload_str = reply.data[12:(12+str_len-1)]
-            lines = payload_str.splitlines();
-            host_data = {}
-            host_data['host_id'] = host_id
-            for line in lines:
-                (key, value) = line.split(':', 1)
-                host_data[key] = value
-            print "Status Update"
-            pprint(host_data)
-            # Note: State:Offline means this daemon has died and the host_id should be removed.
-        elif msg_type == 86:
-            (host_id, job_id, start_time, str_len) = struct.unpack('!LLLL', bytearray(reply.data)[4:20])
-            filename_str = reply.data[20:(20+str_len-1)]
-            start_dt = datetime.fromtimestamp(start_time)
-            job_data = {'host_id': host_id, 'job_id': job_id, 'start_time': start_dt, 'file_name': filename_str}
-            print "Local Job Begin"
-            pprint(job_data)
-        elif msg_type == 79:
-            job_id = struct.unpack('!L', bytearray(reply.data)[4:])[0]
-            job_data = {'job_id': job_id}
-            print "Local Job End"
-            pprint(job_data)
-        else:
-            print "undhandle message type:", msg_type
-            hexstr = ':'.join(x.encode('hex') for x in (reply.data))
-            print(reply.type, hexstr, reply.data)
+        msg = ServerMessage(reply.data)
+        msg.parse_data()
 
 # Relevant message types:    
 #    M_MON_LOGIN, R 82 -- handled, Only sent.
-#    M_MON_GET_CS, S 83 -- 
+#    M_MON_GET_CS, S 83 --  MonGetCSMsg(job->id(), submitter->hostId(), m)
 #    M_MON_JOB_BEGIN T 84 -- MonJobBeginMsg(m->job_id, m->stime, cs->hostId())
 #    M_MON_JOB_DONE U 85 -- MonJobDoneMsg(*m) or  MonJobDoneMsg(JobDoneMsg((*jit)->id(),  255)) (when daemon dies)
 #    M_MON_LOCAL_JOB_BEGIN V 86 -- handled.
