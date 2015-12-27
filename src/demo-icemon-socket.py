@@ -10,6 +10,8 @@ import socket
 import struct
 import threading
 import Queue
+from pprint import pprint
+from datetime import datetime
 
 
 class ClientCommand(object):
@@ -184,20 +186,45 @@ if __name__ == "__main__":
         sct.cmd_q.put(ClientCommand(ClientCommand.RECEIVE))
         reply = sct.reply_q.get(True)
         msg_type = struct.unpack('!L', bytearray(reply.data)[:4])[0]
-        print "msg_type", msg_type
-        print msg_type
+        payload = bytearray(reply.data)[4:]
         if msg_type == 87:
-            print "is status"
             (host_id, str_len) = struct.unpack('!LL', bytearray(reply.data)[4:12])
-            print "host id", host_id, "str len", str_len
-            payload_str = reply.data[12:]
-            print "str:", payload_str, ":"
-            print "strlen", len(payload_str)
+            payload_str = reply.data[12:(12+str_len-1)]
+            lines = payload_str.splitlines();
+            host_data = {}
+            host_data['host_id'] = host_id
+            for line in lines:
+                (key, value) = line.split(':', 1)
+                host_data[key] = value
+            print "Status Update"
+            pprint(host_data)
+            # Note: State:Offline means this daemon has died and the host_id should be removed.
+        elif msg_type == 86:
+            (host_id, job_id, start_time, str_len) = struct.unpack('!LLLL', bytearray(reply.data)[4:20])
+            filename_str = reply.data[20:(20+str_len-1)]
+            start_dt = datetime.fromtimestamp(start_time)
+            job_data = {'host_id': host_id, 'job_id': job_id, 'start_time': start_dt, 'file_name': filename_str}
+            print "Local Job Begin"
+            pprint(job_data)
+        elif msg_type == 79:
+            job_id = struct.unpack('!L', bytearray(reply.data)[4:])[0]
+            job_data = {'job_id': job_id}
+            print "Local Job End"
+            pprint(job_data)
         else:
-            print "is not status"
-            
-        hexstr = ':'.join(x.encode('hex') for x in (reply.data))
-        print(reply.type, hexstr, reply.data)
+            print "undhandle message type:", msg_type
+            hexstr = ':'.join(x.encode('hex') for x in (reply.data))
+            print(reply.type, hexstr, reply.data)
+
+# Relevant message types:    
+#    M_MON_LOGIN, R 82 -- handled, Only sent.
+#    M_MON_GET_CS, S 83 -- 
+#    M_MON_JOB_BEGIN T 84 -- MonJobBeginMsg(m->job_id, m->stime, cs->hostId())
+#    M_MON_JOB_DONE U 85 -- MonJobDoneMsg(*m) or  MonJobDoneMsg(JobDoneMsg((*jit)->id(),  255)) (when daemon dies)
+#    M_MON_LOCAL_JOB_BEGIN V 86 -- handled.
+#    M_MON_STATS W 87 -- handled. Sent at login, and when daemon resents M_STATS message.
+#    M_JOB_LOCAL_DONE O 79 -- handled.
+
     sct.cmd_q.put(ClientCommand(ClientCommand.CLOSE))
     reply = sct.reply_q.get(True)
     print(reply.type, reply.data)
