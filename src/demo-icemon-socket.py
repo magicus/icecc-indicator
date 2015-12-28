@@ -272,17 +272,75 @@ class ServerMessage(object):
             #    M_MON_GET_CS, S 83 --  MonGetCSMsg(job->id(), submitter->hostId(), m)
             # FIXME
 
+            #void GetCSMsg::send_to_channel(MsgChannel *c) const
+            #{
+                #Msg::send_to_channel(c);
+                #c->write_environments(versions);
+                #*c << shorten_filename(filename);
+                #*c << (uint32_t) lang;
+                #*c << count;
+                #*c << target;
+                #*c << arg_flags;
+                #*c << client_id;
+
+                #if (IS_PROTOCOL_22(c)) {
+                    #*c << preferred_host;
+                #}
+
+                #if (IS_PROTOCOL_31(c)) {
+                    #*c << uint32_t(minimal_host_version >= 31 ? 1 : 0);
+                #}
+                #if (IS_PROTOCOL_34(c)) {
+                    #*c << minimal_host_version;
+                #}
+            #}
+
+            #void MonGetCSMsg::send_to_channel(MsgChannel *c) const
+            #{
+                #if (IS_PROTOCOL_29(c)) {
+                    #Msg::send_to_channel(c);
+                    #*c << shorten_filename(filename);
+                    #*c << (uint32_t) lang;
+                #} else {
+                    #GetCSMsg::send_to_channel(c);
+                #}
+
+                #*c << job_id;
+                #*c << clientid;
+            #}
             self.values['msg_desc'] = "Get Compile Server (Request compilation work?)"
 
         elif msg_type == ServerMessage.M_MON_JOB_BEGIN:
             #    M_MON_JOB_BEGIN T 84 -- MonJobBeginMsg(m->job_id, m->stime, cs->hostId())
             # FIXME
+            #void MonJobBeginMsg::fill_from_channel(MsgChannel *c)
+            #{
+                #Msg::fill_from_channel(c);
+                #*c >> job_id;
+                #*c >> stime;
+                #*c >> hostid;
+            #}
 
             self.values['msg_desc'] = "Remote Job Begin"
 
         elif msg_type == ServerMessage.M_MON_JOB_DONE:
             #    M_MON_JOB_DONE U 85 -- MonJobDoneMsg(*m) or  MonJobDoneMsg(JobDoneMsg((*jit)->id(),  255)) (when daemon dies)
             # FIXME
+            #void JobDoneMsg::send_to_channel(MsgChannel *c) const
+            #{
+                #Msg::send_to_channel(c);
+                #*c << job_id;
+                #*c << (uint32_t) exitcode;
+                #*c << real_msec;
+                #*c << user_msec;
+                #*c << sys_msec;
+                #*c << pfaults;
+                #*c << in_compressed;
+                #*c << in_uncompressed;
+                #*c << out_compressed;
+                #*c << out_uncompressed;
+                #*c << flags;
+            #}
 
             self.values['msg_desc'] = "Remote Job End"
 
