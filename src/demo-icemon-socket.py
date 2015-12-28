@@ -47,6 +47,9 @@ class ClientReply(object):
         self.data = data
 
 
+class ConnState:
+    STATE_NEW, STATE_REQUEST_OPEN, STATE_CONNECTING, STATE_CONNECTED, STATE_OPEN, STATE_REQUEST_CLOSE, STATE_CLOSING, STATE_CLOSED, STATE_FAILED = range(9)
+
 class IceccMonitorClientThread(threading.Thread):
     """ Implements the threading.Thread interface (start, join, etc.) and
         can be controlled via the cmd_q Queue attribute. Replies are placed in
@@ -60,53 +63,79 @@ class IceccMonitorClientThread(threading.Thread):
         self.alive = threading.Event()
         self.alive.set()
         self.socket = None
-        self.msgs = Queue.Queue()
         self.isClosed = False
+        self.lock = threading.Condition()
+        self.state = ConnState.STATE_NEW
 
-        self.handlers = {
-            ClientCommand.CONNECT: self._handle_CONNECT,
-            ClientCommand.CLOSE: self._handle_CLOSE,
-            ClientCommand.RECEIVE: self._handle_RECEIVE,
-        }
+    def _set_state(self, state):
+        with self.lock:
+            self.state = state
+            self.lock.notifyAll()
 
     def run(self):
-        while self.alive.isSet():
+        print "running"
+        with self.lock:
+            while self.state < ConnState.STATE_REQUEST_OPEN:
+                self.lock.wait()
+
+        print "req conn"
+        # Connect requested
+        self._connect()
+
+        print "connected"
+        with self.lock:
+            state = self.state
+
+        while state <= ConnState.STATE_OPEN:
             try:
-                # Queue.get with timeout to allow checking self.alive
-                cmd = self.cmd_q.get(True, 0.1)
-                self.handlers[cmd.type](cmd)
-            except Queue.Empty as e:
-                continue
+                self._handle_messages()
+                with self.lock:
+                    state = self.state
+            except IOError as e:
+                self._set_state(ConnState.STATE_REQUEST_CLOSE)
 
-    def stop(self, timeout=5):
-        if self.isClosed:
-            return
+        print "closing"
+        self.socket.close()
+        self._set_state(ConnState.STATE_CLOSING)
+        print "closed"
 
-        self.alive.clear()
-        print "stopped, closing"
-        # ask thread to close
-        self.cmd_q.put(ClientCommand(ClientCommand.CLOSE))
-        print "waiting for reply"
+    def request_connect(self):
+        with self.lock:
+            if self.state < ConnState.STATE_REQUEST_OPEN:
+                self._set_state(ConnState.STATE_REQUEST_OPEN)
+
+    def request_close(self, timeout=5):
+        with self.lock:
+            if self.state >= ConnState.STATE_CLOSED:
+                return
+            if self.state >= ConnState.STATE_REQUEST_CLOSE:
+                # Already requested
+                lock.wait(timeout)
+                if self.state >= ConnState.STATE_CLOSED:
+                    return
+                raise IOError('Close timed out')
+            self._set_state(ConnState.STATE_REQUEST_CLOSE)
+
+        with self.lock:
+            lock.wait(timeout)
+            if self.state <= ConnState.STATE_CLOSING:
+                raise IOError('Close timed out')
+
+        threading.Thread.join(self, timeout)
+        if not self.is_alive():
+            self._set_state(ConnState.STATE_CLOSED)
+        else:
+            self._set_state(ConnState.STATE_FAILED)
+
+    def _connect(self):
         try:
-            reply = self.reply_q.get(True, timeout)
-            print "reply gotten"
-            if reply.type != ClientReply.SUCCESS:
-                print "failure", reply
-                print "f data", reply.data
-                raise reply.data
-        except Queue.Empty as e:
-            raise IOError('Timeout waiting for socket close')
-        finally:
-            print "joining2"
-            threading.Thread.join(self, timeout)
-            self.isClosed = True;
-            print "joined!2"
+            self._set_state(ConnState.STATE_CONNECTING)
 
-    def _handle_CONNECT(self, cmd):
-        try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.connect((self.connection.host, self.connection.port))
             self.socket.settimeout(0.5)
+
+            self._set_state(ConnState.STATE_CONNECTED)
 
             # handshake first time
             # FIXME: adjust protocol version?
@@ -133,70 +162,67 @@ class IceccMonitorClientThread(threading.Thread):
 
             header = struct.pack('!L', len(login_msg))
             self.socket.sendall(header + login_msg)
-            self.reply_q.put(self._success_reply())
+            self._set_state(ConnState.STATE_OPEN)
         except IOError as e:
             print "got io error in connect", e
-            self.reply_q.put(self._error_reply(e))
-            if not self.alive.isSet():
-                self.reply_q.put(self._error_reply(IOError('Thread closed')))
+            self.socket.close()
+            self._set_state(ConnState.STATE_FAILED)
 
-    def _handle_CLOSE(self, cmd):
-        print "closing"
-        self.socket.close()
-        print "closed"
-        self.reply_q.put(self._success_reply())
-        print "replied"
-
-    def _handle_RECEIVE(self, cmd):
+    def _handle_messages(self):
         try:
             print "about recv"
             header_data = self._recv_n_bytes(4)
             print "got header"
             msg_len = struct.unpack('!L', header_data)[0]
             data = self._recv_n_bytes(msg_len)
+            hexstr = ':'.join(x.encode('hex') for x in (data))
+            print('REPLY', hexstr, data)
             self.reply_q.put(self._success_reply(data))
+
         except IOError as e:
             print "got io error", e
             self.reply_q.put(self._error_reply(e))
-            # I don't get this. Queue.put() does not seem to signal properly
-            # when alive has been cleared. Need a second call to trigger
-            # a reaction.
-            if not self.alive.isSet():
-                self.reply_q.put(self._error_reply(IOError('Thread closed')))
+            self._set_state(ConnState.STATE_REQUEST_CLOSE)
 
     def _recv_n_bytes(self, n):
         """ Convenience method for receiving exactly n bytes from self.socket
             (assuming it's open and connected).
         """
         data = ''
-        while len(data) < n and self.alive.isSet():
+        with self.lock:
+            state = self.state
+        while state <= ConnState.STATE_OPEN and len(data) < n:
             try:
                 chunk = self.socket.recv(n - len(data))
                 if chunk == '':
                     break
                 data += chunk
+                with self.lock:
+                    state = self.state
             except socket.timeout:
-                if not self.alive.isSet():
+                with self.lock:
+                    state = self.state
+
+                if state >= ConnState.STATE_REQUEST_CLOSE:
                     raise IOError('Connection thread has shut down')
                 continue
-        if not self.alive.isSet():
+        if state >= ConnState.STATE_REQUEST_CLOSE:
             raise IOError('Connection thread has shut down')
         assert (len(data) == n)
         return data
 
-    def get_next(self):
-        sct = self
-        sct.cmd_q.put(ClientCommand(ClientCommand.RECEIVE))
-        reply = sct.reply_q.get(True, 1)
-        hexstr = ':'.join(x.encode('hex') for x in (reply.data))
-        print('REPLY', reply.type, hexstr, reply.data)
-        if reply.type == ClientReply.ERROR:
-            print "error when revcv"
-            print(reply.type, reply.data)
-            raise SystemExit
-        msg = ServerMessage(reply.data)
-        msg.parse_data()
-        self.msgs.put(msg.values)
+    def get_next(self, timeout=10):
+        with self.lock:
+            state = self.state
+
+        if state > ConnState.STATE_OPEN:
+            raise IOError('Channel closed')
+
+        reply = self.reply_q.get(True, timeout)
+        if reply.type != ClientReply.SUCCESS:
+            print "failure receive"
+            raise reply.data
+        return reply.data
 
     def _error_reply(self, errstr):
         return ClientReply(ClientReply.ERROR, errstr)
@@ -364,36 +390,37 @@ class IceccMonitorConnection:
 
     def connect(self, timeout=10):
         self.clientThread.start()
-        self.clientThread.cmd_q.put(ClientCommand(ClientCommand.CONNECT))
-        try:
-            reply = self.clientThread.reply_q.get(True, timeout)
-            print "done connecting", reply
-            if reply.type != ClientReply.SUCCESS:
-                print "failure connect"
-                raise reply.data
-        except Queue.Empty:
-            try:
-                print "tIMME out"
-                self.close()
-                print "close done"
-            except IOError as e:
-                print "oppsi"
-                raise IOError("Connection timed out", e)
+        self.clientThread.request_connect()
 
-    def get_message(self, block=True, timeout=0):
+        with self.clientThread.lock:
+            self.clientThread.lock.wait(timeout)
+            if (self.clientThread.state != ConnState.STATE_OPEN):
+                raise IOError('Connection timed out')
+
+    def get_message(self, block=True, timeout=10):
+
         print "aj"
-        self.clientThread.get_next()
-        msg = self.clientThread.msgs.get(True, 1)
+        data = self.clientThread.get_next(timeout)
+
+        hexstr = ':'.join(x.encode('hex') for x in (data))
+        print('REPLY',  hexstr, data)
+        msg = ServerMessage(data)
+        msg.parse_data()
         print "we got msg"
         if 'error' in msg:
             print "error when revcv"
             raise SystemExit
         return msg
 
-    def close(self):
+    def close(self, timeout=10):
         print "oj"
-        self.clientThread.stop()
-        #
+        with self.clientThread.lock:
+            self.clientThread._set_state(ConnState.STATE_REQUEST_CLOSE)
+
+        with self.clientThread.lock:
+            self.clientThread.lock.wait(timeout)
+            if (self.clientThread.state != ConnState.STATE_CLOSED):
+                raise IOError('Close timed out')
 
 #------------------------------------------------------------------------------
 if __name__ == "__main__":
