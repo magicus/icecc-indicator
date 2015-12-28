@@ -14,23 +14,22 @@ import Queue
 import time
 from pprint import pprint
 from datetime import datetime
+from collections import deque
 
+class IceccMonError(Exception):
+    pass
 
-class ClientCommand(object):
-    """ A command to the client thread.
-        Each command type has its associated data:
+class IceccMonTimeout(IceccMonError):
+    pass
 
-        CONNECT:    (host, port) tuple
-        SEND:       Data string
-        RECEIVE:    None
-        CLOSE:      None
-    """
-    CONNECT, RECEIVE, CLOSE = range(3)
+class IceccMonIOError(IceccMonError):
+    pass
 
-    def __init__(self, type):
-        self.type = type
+class IceccMonConnectionError(IceccMonIOError):
+    pass
 
-
+class IceccMonConnectionClosed(IceccMonIOError):
+    pass
 
 class ClientReply(object):
     """ A reply from the client thread.
@@ -51,138 +50,117 @@ class ConnState:
     STATE_NEW, STATE_REQUEST_OPEN, STATE_CONNECTING, STATE_CONNECTED, STATE_OPEN, STATE_REQUEST_CLOSE, STATE_CLOSING, STATE_CLOSED, STATE_FAILED = range(9)
 
 class IceccMonitorClientThread(threading.Thread):
-    """ Implements the threading.Thread interface (start, join, etc.) and
-        can be controlled via the cmd_q Queue attribute. Replies are placed in
-        the reply_q Queue attribute.
+    """ Implements the threading.Thread interface (start, join, etc.).
+        Incoming messages are placed in the msg_queue Queue attribute.
     """
     def __init__(self, connection):
         super(IceccMonitorClientThread, self).__init__()
         self.connection = connection
-        self.cmd_q = Queue.Queue()
-        self.reply_q = Queue.Queue()
-        self.alive = threading.Event()
-        self.alive.set()
         self.socket = None
-        self.isClosed = False
+
+        # Variables protected by the lock
         self.lock = threading.Condition()
         self.state = ConnState.STATE_NEW
+        self.msg_queue = deque()
+        self.error = None
 
     def _set_state(self, state):
         with self.lock:
             self.state = state
             self.lock.notifyAll()
 
+    def _set_error(self, error, state):
+        with self.lock:
+            self.error = error
+            self.state = state
+            self.lock.notifyAll()
+
+    def _set_data(self, state):
+        with self.lock:
+            self.state = state
+            self.lock.notifyAll()
+
     def run(self):
-        print "running"
+        # Wait for request to connect
         with self.lock:
             while self.state < ConnState.STATE_REQUEST_OPEN:
                 self.lock.wait()
 
-        print "req conn"
         # Connect requested
-        self._connect()
+        try:
+            self._connect()
+            self._set_state(ConnState.STATE_OPEN)
+        except IceccMonConnectionClosed as e:
+            print "connect abort"
+            # Already has state request close
+            pass
+        except IOError as e:
+            print "got io error in connect", e
+            self.socket.close()
+            # if e.errno == errno.ECONNREFUSED:
+            with self.lock:
+                self._set_error(IceccMonConnectionError(e), ConnState.STATE_CLOSING)
+            return
 
-        print "connected"
         with self.lock:
             state = self.state
 
-        while state <= ConnState.STATE_OPEN:
+        while state == ConnState.STATE_OPEN:
             try:
                 self._handle_messages()
-                with self.lock:
-                    state = self.state
+            except IceccMonConnectionClosed as e:
+                pass
             except IOError as e:
-                self._set_state(ConnState.STATE_REQUEST_CLOSE)
+                print "got io error", e
+                with self.lock:
+                    self._set_error(IceccMonIOError(e), ConnState.STATE_REQUEST_CLOSE)
+
+            with self.lock:
+                state = self.state
 
         print "closing"
         self.socket.close()
         self._set_state(ConnState.STATE_CLOSING)
         print "closed"
 
-    def request_connect(self):
-        with self.lock:
-            if self.state < ConnState.STATE_REQUEST_OPEN:
-                self._set_state(ConnState.STATE_REQUEST_OPEN)
-
-    def request_close(self, timeout=5):
-        with self.lock:
-            if self.state >= ConnState.STATE_CLOSED:
-                return
-            if self.state >= ConnState.STATE_REQUEST_CLOSE:
-                # Already requested
-                lock.wait(timeout)
-                if self.state >= ConnState.STATE_CLOSED:
-                    return
-                raise IOError('Close timed out')
-            self._set_state(ConnState.STATE_REQUEST_CLOSE)
-
-        with self.lock:
-            lock.wait(timeout)
-            if self.state <= ConnState.STATE_CLOSING:
-                raise IOError('Close timed out')
-
-        threading.Thread.join(self, timeout)
-        if not self.is_alive():
-            self._set_state(ConnState.STATE_CLOSED)
-        else:
-            self._set_state(ConnState.STATE_FAILED)
-
     def _connect(self):
-        try:
-            self._set_state(ConnState.STATE_CONNECTING)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.connect((self.connection.host, self.connection.port))
+        self.socket.settimeout(0.5)
 
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((self.connection.host, self.connection.port))
-            self.socket.settimeout(0.5)
+        # handshake first time
+        # FIXME: adjust protocol version?
+        proto_ver = struct.pack('<L', 32)
 
-            self._set_state(ConnState.STATE_CONNECTED)
+        self.socket.sendall(proto_ver)
 
-            # handshake first time
-            # FIXME: adjust protocol version?
-            proto_ver = struct.pack('<L', 32)
+        header_data = self._recv_n_bytes(4)
+        proto_ver2 = struct.unpack('<L', header_data)[0]
+        # FIXME: verify protocol version
+        print "got proto ver 2", proto_ver2
 
-            self.socket.sendall(proto_ver)
+        # handshake second time
+        # FIXME: adjust protocol version?
+        self.socket.sendall(proto_ver)
 
-            header_data = self._recv_n_bytes(4)
-            proto_ver2 = struct.unpack('<L', header_data)[0]
-            # FIXME: verify protocol version
-            print "got proto ver 2", proto_ver2
+        header_data = self._recv_n_bytes(4)
+        proto_ver3 = struct.unpack('<L', header_data)[0]
+        # FIXME: verify protocol version
+        print "got proto ver 3", proto_ver3
 
-            # handshake second time
-            # FIXME: adjust protocol version?
-            self.socket.sendall(proto_ver)
+        # login as monitor
+        login_msg = struct.pack('!L', ServerMessage.M_MON_LOGIN)
 
-            header_data = self._recv_n_bytes(4)
-            proto_ver3 = struct.unpack('<L', header_data)[0]
-            # FIXME: verify protocol version
-            print "got proto ver 3", proto_ver3
-
-            # login as monitor
-            login_msg = struct.pack('!L', ServerMessage.M_MON_LOGIN)
-
-            header = struct.pack('!L', len(login_msg))
-            self.socket.sendall(header + login_msg)
-            self._set_state(ConnState.STATE_OPEN)
-        except IOError as e:
-            print "got io error in connect", e
-            self.socket.close()
-            self._set_state(ConnState.STATE_FAILED)
+        header = struct.pack('!L', len(login_msg))
+        self.socket.sendall(header + login_msg)
 
     def _handle_messages(self):
-        try:
-            print "about recv"
-            header_data = self._recv_n_bytes(4)
-            print "got header"
-            msg_len = struct.unpack('!L', header_data)[0]
-            data = self._recv_n_bytes(msg_len)
-            hexstr = ':'.join(x.encode('hex') for x in (data))
-            print('REPLY', hexstr, data)
-            self.reply_q.put(self._success_reply(data))
-
-        except IOError as e:
-            print "got io error", e
-            self.reply_q.put(self._error_reply(e))
-            self._set_state(ConnState.STATE_REQUEST_CLOSE)
+        header_data = self._recv_n_bytes(4)
+        msg_len = struct.unpack('!L', header_data)[0]
+        data = self._recv_n_bytes(msg_len)
+        with self.lock:
+            self.msg_queue.append(data)
+            self.lock.notifyAll()
 
     def _recv_n_bytes(self, n):
         """ Convenience method for receiving exactly n bytes from self.socket
@@ -204,31 +182,77 @@ class IceccMonitorClientThread(threading.Thread):
                     state = self.state
 
                 if state >= ConnState.STATE_REQUEST_CLOSE:
-                    raise IOError('Connection thread has shut down')
+                    raise IceccMonConnectionClosed('Connection thread has shut down')
                 continue
         if state >= ConnState.STATE_REQUEST_CLOSE:
-            raise IOError('Connection thread has shut down')
+            raise IceccMonConnectionClosed('Connection thread has shut down')
         assert (len(data) == n)
         return data
 
-    def get_next(self, timeout=10):
+    def request_connect(self):
         with self.lock:
-            state = self.state
+            if self.state < ConnState.STATE_REQUEST_OPEN:
+                self._set_state(ConnState.STATE_REQUEST_OPEN)
 
-        if state > ConnState.STATE_OPEN:
-            raise IOError('Channel closed')
+    def wait_for_connect(self, timeout=10):
+        end_time = time.time() + timeout
+        with self.lock:
+            while self.state < ConnState.STATE_OPEN:
+                if self.error:
+                    raise self.error
+                remaining_time = end_time - time.time()
+                if remaining_time <= 0:
+                    raise IceccMonConnectionError('Connection timed out')
+                self.lock.wait(remaining_time)
 
-        reply = self.reply_q.get(True, timeout)
-        if reply.type != ClientReply.SUCCESS:
-            print "failure receive"
-            raise reply.data
-        return reply.data
+    def request_close(self):
+        with self.lock:
+            if self.state < ConnState.STATE_REQUEST_CLOSE:
+                self._set_state(ConnState.STATE_REQUEST_CLOSE)
 
-    def _error_reply(self, errstr):
-        return ClientReply(ClientReply.ERROR, errstr)
+    def wait_for_close(self, timeout=5):
+        end_time = time.time() + timeout
+        with self.lock:
+            while self.state < ConnState.STATE_CLOSING:
+                if self.error:
+                    # At this point, we really don't care about IOErrors
+                    return False
+                remaining_time = end_time - time.time()
+                if remaining_time <= 0:
+                    raise IceccMonTimeout
+                self.lock.wait(remaining_time)
 
-    def _success_reply(self, data=None):
-        return ClientReply(ClientReply.SUCCESS, data)
+        remaining_time = end_time - time.time()
+        if remaining_time <= 0:
+            # Even if we're out of time, give us the chance to join properly
+            remaining_time = 0.1
+        threading.Thread.join(self, remaining_time)
+        if not self.is_alive():
+            self._set_state(ConnState.STATE_CLOSED)
+        else:
+            self._set_state(ConnState.STATE_FAILED)
+
+        return self.state == ConnState.STATE_CLOSED
+
+    def get_next(self, timeout=10):
+        end_time = time.time() + timeout
+        with self.lock:
+            while self.state <= ConnState.STATE_OPEN:
+                if self.error:
+                    raise self.error
+
+                if self.msg_queue:
+                    data = self.msg_queue.popleft()
+                    return data
+
+                remaining_time = end_time - time.time()
+                if remaining_time <= 0:
+                    raise IceccMonTimeout
+                self.lock.wait(remaining_time)
+
+            assert(self.state > ConnState.STATE_OPEN)
+            raise IceccMonConnectionClosed()
+
 
 class ServerMessage(object):
     M_JOB_LOCAL_DONE = 79
@@ -377,9 +401,8 @@ class ServerMessage(object):
             print(reply.type, hexstr, reply.data)
             self.values['msg_desc'] = "Unknown"
             self.values['error'] = True
+            self.values['payload'] = reply.data
 
-        print "values:"
-        pprint(self.values)
 
 class IceccMonitorConnection:
     def __init__(self, host, port=8765):
@@ -391,38 +414,23 @@ class IceccMonitorConnection:
     def connect(self, timeout=10):
         self.clientThread.start()
         self.clientThread.request_connect()
+        self.clientThread.wait_for_connect(timeout)
 
-        with self.clientThread.lock:
-            self.clientThread.lock.wait(timeout)
-            if (self.clientThread.state != ConnState.STATE_OPEN):
-                raise IOError('Connection timed out')
 
     def get_message(self, block=True, timeout=10):
 
         print "aj"
         data = self.clientThread.get_next(timeout)
 
-        hexstr = ':'.join(x.encode('hex') for x in (data))
-        print('REPLY',  hexstr, data)
         msg_obj = ServerMessage(data)
         msg_obj.parse_data()
-
         msg = msg_obj.values
-        print "we got msg"
-        if 'error' in msg:
-            print "error when revcv"
-            raise SystemExit
         return msg
 
     def close(self, timeout=10):
         print "oj"
-        with self.clientThread.lock:
-            self.clientThread._set_state(ConnState.STATE_REQUEST_CLOSE)
-
-        with self.clientThread.lock:
-            self.clientThread.lock.wait(timeout)
-            if (self.clientThread.state != ConnState.STATE_CLOSED):
-                raise IOError('Close timed out')
+        self.clientThread.request_close()
+        return self.clientThread.wait_for_close(timeout)
 
 #------------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -448,9 +456,9 @@ if __name__ == "__main__":
         while not quit_loop:
             try:
                 msg = ic.get_message()
-                print "we got msg 2"
-                print msg
-            except Queue.Empty as e:
+                print "we got msg:"
+                pprint(msg)
+            except IceccMonTimeout as e:
                 print "idle"
                 continue
             except KeyboardInterrupt as e:
