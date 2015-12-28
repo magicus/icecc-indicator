@@ -404,8 +404,10 @@ class IceccMonitorConnection:
 
         hexstr = ':'.join(x.encode('hex') for x in (data))
         print('REPLY',  hexstr, data)
-        msg = ServerMessage(data)
-        msg.parse_data()
+        msg_obj = ServerMessage(data)
+        msg_obj.parse_data()
+
+        msg = msg_obj.values
         print "we got msg"
         if 'error' in msg:
             print "error when revcv"
