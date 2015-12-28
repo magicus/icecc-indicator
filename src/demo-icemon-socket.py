@@ -11,6 +11,7 @@ import errno
 import struct
 import threading
 import Queue
+import time
 from pprint import pprint
 from datetime import datetime
 
@@ -26,9 +27,8 @@ class ClientCommand(object):
     """
     CONNECT, RECEIVE, CLOSE = range(3)
 
-    def __init__(self, type, data=None):
+    def __init__(self, type):
         self.type = type
-        self.data = data
 
 
 
@@ -61,6 +61,7 @@ class IceccMonitorClientThread(threading.Thread):
         self.alive.set()
         self.socket = None
         self.msgs = Queue.Queue()
+        self.isClosed = False
 
         self.handlers = {
             ClientCommand.CONNECT: self._handle_CONNECT,
@@ -77,93 +78,73 @@ class IceccMonitorClientThread(threading.Thread):
             except Queue.Empty as e:
                 continue
 
-    def stop(self):
-        self.alive.clear()
+    def stop(self, timeout=5):
+        if self.isClosed:
+            return
 
-    def join(self, timeout=None):
         self.alive.clear()
-        threading.Thread.join(self, timeout)
-
-    def _handle_CONNECT_inner(self, cmd):
+        print "stopped, closing"
+        # ask thread to close
+        self.cmd_q.put(ClientCommand(ClientCommand.CLOSE))
+        print "waiting for reply"
         try:
-            print "inner con"
-            self.socket = socket.socket(
-                socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((self.connection.host, self.connection.port))
-            self.socket.settimeout(0.5)
-            print "con"
-            self.reply_q.put(self._success_reply())
-            print "q put"
-        except socket.error as e:
-            if e.errno == errno.ECONNREFUSED:
-                print "refuuuuused"
-                self.reply_q.put(self._error_reply("REFUSED"+str(e)))
-            else:
-                self.reply_q.put(self._error_reply(str(e)))
-        except IOError as e:
-            self.reply_q.put(self._error_reply(str(e)))
+            reply = self.reply_q.get(True, timeout)
+            print "reply gotten"
+            if reply.type != ClientReply.SUCCESS:
+                print "failure", reply
+                print "f data", reply.data
+                raise reply.data
+        except Queue.Empty as e:
+            raise IOError('Timeout waiting for socket close')
+        finally:
+            print "joining2"
+            threading.Thread.join(self, timeout)
+            self.isClosed = True;
+            print "joined!2"
 
     def _handle_CONNECT(self, cmd):
-        print "at connect"
-        self._handle_CONNECT_inner(cmd)
-        print "connected"
-        reply = self.reply_q.get(True, 5)
-        print "gotten", reply
-        print(reply.type, reply.data)
-        if reply.type == ClientReply.ERROR:
-            print "error"
-            raise SystemExit
-
-        self.handshake()
-
-        self.login()
-
-    def handshake(self):
-        sct = self
-
-        proto_ver = struct.pack('<L', 32)
         try:
-            self.socket.sendall(proto_ver)
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect((self.connection.host, self.connection.port))
+            self.socket.settimeout(0.5)
 
-            header_data = self._recv_n_bytes(4)
-            if len(header_data) == 4:
-                proto_ver2 = struct.unpack('<L', header_data)[0]
-                print "got proto ver 2", proto_ver2
-            else:
-                print "error io"
-                raise IOError("bad proto")
+            # handshake first time
+            # FIXME: adjust protocol version?
+            proto_ver = struct.pack('<L', 32)
 
             self.socket.sendall(proto_ver)
 
             header_data = self._recv_n_bytes(4)
-            if len(header_data) == 4:
-                proto_ver3 = struct.unpack('<L', header_data)[0]
-                print "got proto ver 3", proto_ver3
-            else:
-                print "error io 2"
-                raise IOError("bad proto 2")
+            proto_ver2 = struct.unpack('<L', header_data)[0]
+            # FIXME: verify protocol version
+            print "got proto ver 2", proto_ver2
 
-        except IOError as e:
-            self.reply_q.put(self._error_reply(str(e)))
+            # handshake second time
+            # FIXME: adjust protocol version?
+            self.socket.sendall(proto_ver)
 
-    def login(self):
-        login_msg = struct.pack('!L', ServerMessage.M_MON_LOGIN)
+            header_data = self._recv_n_bytes(4)
+            proto_ver3 = struct.unpack('<L', header_data)[0]
+            # FIXME: verify protocol version
+            print "got proto ver 3", proto_ver3
 
-        header = struct.pack('!L', len(login_msg))
-        try:
+            # login as monitor
+            login_msg = struct.pack('!L', ServerMessage.M_MON_LOGIN)
+
+            header = struct.pack('!L', len(login_msg))
             self.socket.sendall(header + login_msg)
-            print "sent login"
             self.reply_q.put(self._success_reply())
         except IOError as e:
-            print "login errir"
-            self.reply_q.put(self._error_reply(str(e)))
+            print "got io error in connect", e
+            self.reply_q.put(self._error_reply(e))
+            if not self.alive.isSet():
+                self.reply_q.put(self._error_reply(IOError('Thread closed')))
 
     def _handle_CLOSE(self, cmd):
         print "closing"
         self.socket.close()
         print "closed"
-        reply = ClientReply(ClientReply.SUCCESS)
-        self.reply_q.put(reply)
+        self.reply_q.put(self._success_reply())
         print "replied"
 
     def _handle_RECEIVE(self, cmd):
@@ -171,18 +152,17 @@ class IceccMonitorClientThread(threading.Thread):
             print "about recv"
             header_data = self._recv_n_bytes(4)
             print "got header"
-            if len(header_data) == 4:
-                msg_len = struct.unpack('!L', header_data)[0]
-                data = self._recv_n_bytes(msg_len)
-                if len(data) == msg_len:
-                    self.reply_q.put(self._success_reply(data))
-                    return
-            self.reply_q.put(self._error_reply('Socket closed prematurely'))
+            msg_len = struct.unpack('!L', header_data)[0]
+            data = self._recv_n_bytes(msg_len)
+            self.reply_q.put(self._success_reply(data))
         except IOError as e:
             print "got io error", e
-            self.reply_q.put(self._error_reply(str(e)))
+            self.reply_q.put(self._error_reply(e))
+            # I don't get this. Queue.put() does not seem to signal properly
+            # when alive has been cleared. Need a second call to trigger
+            # a reaction.
             if not self.alive.isSet():
-                self.reply_q.put(self._error_reply('Thread closed'))
+                self.reply_q.put(self._error_reply(IOError('Thread closed')))
 
     def _recv_n_bytes(self, n):
         """ Convenience method for receiving exactly n bytes from self.socket
@@ -196,15 +176,13 @@ class IceccMonitorClientThread(threading.Thread):
                     break
                 data += chunk
             except socket.timeout:
-                print "timeout 2"
                 if not self.alive.isSet():
-                    print "shutting down"
                     raise IOError('Connection thread has shut down')
                 continue
+        if not self.alive.isSet():
+            raise IOError('Connection thread has shut down')
+        assert (len(data) == n)
         return data
-
-    def stop_loop(self):
-        self.quit_loop = True
 
     def get_next(self):
         sct = self
@@ -328,9 +306,21 @@ class IceccMonitorConnection:
 
     def connect(self, timeout=10):
         self.clientThread.start()
-        self.clientThread.cmd_q.put(ClientCommand(ClientCommand.CONNECT, (self.host, 8765)))
-        reply = self.clientThread.reply_q.get(True, timeout)
-        print "done connecting", reply
+        self.clientThread.cmd_q.put(ClientCommand(ClientCommand.CONNECT))
+        try:
+            reply = self.clientThread.reply_q.get(True, timeout)
+            print "done connecting", reply
+            if reply.type != ClientReply.SUCCESS:
+                print "failure connect"
+                raise reply.data
+        except Queue.Empty:
+            try:
+                print "tIMME out"
+                self.close()
+                print "close done"
+            except IOError as e:
+                print "oppsi"
+                raise IOError("Connection timed out", e)
 
     def get_message(self, block=True, timeout=0):
         print "aj"
@@ -345,25 +335,27 @@ class IceccMonitorConnection:
     def close(self):
         print "oj"
         self.clientThread.stop()
-        print "stopped, closing"
-        self.clientThread.cmd_q.put(ClientCommand(ClientCommand.CLOSE))
-        print "waiting for reply"
-        reply = self.clientThread.reply_q.get(True, 10)
-        print "reply gotten"
-        print(reply.type, reply.data)
-        print "joining"
-        self.clientThread.join(5);
         #
 
 #------------------------------------------------------------------------------
 if __name__ == "__main__":
 
     ic = IceccMonitorConnection('localhost')
-    ic.connect()
     try:
-        #sct = SocketClientThread()
-        #sct.start()
-        #sct.cmd_q.put(ClientCommand(ClientCommand.CONNECT, ('localhost', 8765)))
+        ic.connect()
+    except IOError as e:
+        if e.errno == errno.ECONNREFUSED:
+            print "refuuuuused"
+
+        ic.close()
+        raise
+    except KeyboardInterrupt:
+        print "aborting"
+        ic.close();
+        print "closed"
+        raise
+
+    try:
 
         quit_loop = False
         while not quit_loop:
@@ -379,9 +371,5 @@ if __name__ == "__main__":
                 quit_loop = True
         ic.close();
 
-#        sct.cmd_q.put(ClientCommand(ClientCommand.CLOSE))
-#        reply = sct.reply_q.get(True)
-#        print(reply.type, reply.data)
-#        pass
     except KeyboardInterrupt:
         print "aborting"
