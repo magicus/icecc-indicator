@@ -164,7 +164,7 @@ class IceccMonitorClient:
         print "got proto ver 3", proto_ver3
 
         # login as monitor
-        login_msg = struct.pack('!L', IceccMonitorMessageParser.M_MON_LOGIN)
+        login_msg = struct.pack('!L', IceccMonitorProtocolHandler.M_MON_LOGIN)
 
         header = struct.pack('!L', len(login_msg))
         self.socket.sendall(header + login_msg)
@@ -246,18 +246,10 @@ class IceccMonitorClient:
 
 ################################################################################
 
-class IceccMonitorMessageParser(object):
-    M_JOB_LOCAL_DONE = 79
-    M_MON_LOGIN = 82
-    M_MON_GET_CS = 83
-    M_MON_JOB_BEGIN = 84
-    M_MON_JOB_DONE = 85
-    M_MON_LOCAL_JOB_BEGIN = 86
-    M_MON_STATS = 87
+class DataExtractor:
 
     def __init__(self, data):
         self.data = data
-        self.values = {}
 
     def get_int(self):
         value = struct.unpack('!L', self.data[:4])[0]
@@ -276,41 +268,57 @@ class IceccMonitorMessageParser(object):
         value = datetime.fromtimestamp(timestamp)
         return value
 
+    def get_hexdump(self):
+        value = ':'.join(x.encode('hex') for x in self.data)
+        self.data = ''
+        return value
+
     def empty(self):
         return len(self.data) == 0
 
-    def parse_data(self):
-        msg = self
-        msg_type = msg.get_int()
-        self.values['msg_type'] = msg_type
 
-        if msg_type == IceccMonitorMessageParser.M_MON_STATS:
+class IceccMonitorProtocolHandler:
+    M_JOB_LOCAL_DONE = 79
+    M_MON_LOGIN = 82
+    M_MON_GET_CS = 83
+    M_MON_JOB_BEGIN = 84
+    M_MON_JOB_DONE = 85
+    M_MON_LOCAL_JOB_BEGIN = 86
+    M_MON_STATS = 87
+
+    def parse_data(self, data):
+        msg = DataExtractor(data)
+        msg_type = msg.get_int()
+        values = {}
+        values['msg_type'] = msg_type
+
+        if msg_type == self.M_MON_STATS:
             host_id = msg.get_int()
             payload_str = msg.get_string()
             assert msg.empty()
 
-            self.values['host_id'] = host_id
+            values['host_id'] = host_id
             for line in payload_str.splitlines():
                 (key, value) = line.split(':', 1)
-                self.values[key] = value
-            self.values['msg_desc'] = "Status Update"
+                values[key] = value
+            values['msg_desc'] = "Status Update"
             # Note: State:Offline means this daemon has died and the host_id should be removed.
-        elif msg_type == IceccMonitorMessageParser.M_MON_LOCAL_JOB_BEGIN:
+        elif msg_type == self.M_MON_LOCAL_JOB_BEGIN:
             host_id = msg.get_int()
             job_id = msg.get_int()
             start_time = msg.get_timestamp()
             file_name = msg.get_string()
             assert msg.empty()
 
-            self.values.update({'host_id': host_id, 'job_id': job_id, 'start_time': start_time, 'file_name': file_name})
-            self.values['msg_desc'] = "Local Job Begin"
-        elif msg_type == IceccMonitorMessageParser.M_JOB_LOCAL_DONE:
+            values.update({'host_id': host_id, 'job_id': job_id, 'start_time': start_time, 'file_name': file_name})
+            values['msg_desc'] = "Local Job Begin"
+        elif msg_type == self.M_JOB_LOCAL_DONE:
             job_id = msg.get_int()
             assert msg.empty()
 
-            self.values['job_id'] = job_id
-            self.values['msg_desc'] = "Local Job End"
-        elif msg_type == IceccMonitorMessageParser.M_MON_GET_CS:
+            values['job_id'] = job_id
+            values['msg_desc'] = "Local Job End"
+        elif msg_type == self.M_MON_GET_CS:
             #    M_MON_GET_CS, S 83 --  MonGetCSMsg(job->id(), submitter->hostId(), m)
             # FIXME
 
@@ -352,7 +360,7 @@ class IceccMonitorMessageParser(object):
             #}
             self.values['msg_desc'] = "Get Compile Server (Request compilation work?)"
 
-        elif msg_type == IceccMonitorMessageParser.M_MON_JOB_BEGIN:
+        elif msg_type == self.M_MON_JOB_BEGIN:
             #    M_MON_JOB_BEGIN T 84 -- MonJobBeginMsg(m->job_id, m->stime, cs->hostId())
             # FIXME
             #void MonJobBeginMsg::fill_from_channel(MsgChannel *c)
@@ -365,7 +373,7 @@ class IceccMonitorMessageParser(object):
 
             self.values['msg_desc'] = "Remote Job Begin"
 
-        elif msg_type == IceccMonitorMessageParser.M_MON_JOB_DONE:
+        elif msg_type == self.M_MON_JOB_DONE:
             #    M_MON_JOB_DONE U 85 -- MonJobDoneMsg(*m) or  MonJobDoneMsg(JobDoneMsg((*jit)->id(),  255)) (when daemon dies)
             # FIXME
             #void JobDoneMsg::send_to_channel(MsgChannel *c) const
@@ -387,21 +395,21 @@ class IceccMonitorMessageParser(object):
             self.values['msg_desc'] = "Remote Job End"
 
         else:
-            print "unhandled message type:", msg_type
-            self.values['raw_data'] = reply.data
-            hexstr = ':'.join(x.encode('hex') for x in (reply.data))
-            print(reply.type, hexstr, reply.data)
-            self.values['msg_desc'] = "Unknown"
-            self.values['error'] = True
-            self.values['payload'] = reply.data
+            values['hex_dump'] = msg.get_hexdump()
+            assert msg.empty()
 
-        return self.values
+            values['raw_data'] = data
+            values['msg_desc'] = "Unknown"
+            values['error'] = True
+
+        return values
 
 ################################################################################
 
 class IceccMonitor:
     def __init__(self, host='localhost', port=8765):
         self.client = IceccMonitorClient(host, port)
+        self.protocol_handler = IceccMonitorProtocolHandler()
 
     def connect(self, timeout=30):
         self.client.start_thread()
@@ -410,8 +418,7 @@ class IceccMonitor:
 
     def get_message(self, block=True, timeout=0):
         data_block = self.client.get_data_block(block, timeout)
-        parser = IceccMonitorMessageParser(data_block)
-        msg = parser.parse_data()
+        msg = self.protocol_handler.parse_data(data_block)
         return msg
 
     def close(self, timeout=10):
