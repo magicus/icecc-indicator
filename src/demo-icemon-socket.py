@@ -1,16 +1,9 @@
 #!/usr/bin/env python
 
-"""
-Simple socket client thread sample.
-
-Eli Bendersky (eliben@gmail.com)
-This code is in the public domain
-"""
 import socket
 import errno
 import struct
 import threading
-import Queue
 import time
 from pprint import pprint
 from datetime import datetime
@@ -36,9 +29,6 @@ class ConnState:
     STATE_NEW, STATE_REQUEST_OPEN, STATE_CONNECTING, STATE_CONNECTED, STATE_OPEN, STATE_REQUEST_CLOSE, STATE_SOCKET_CLOSED, STATE_CLOSED = range(8)
 
 class IceccMonitorClientThread(threading.Thread):
-    """ Implements the threading.Thread interface (start, join, etc.).
-        Incoming messages are placed in the msg_queue Queue attribute.
-    """
     def __init__(self, connection):
         super(IceccMonitorClientThread, self).__init__()
         self.connection = connection
@@ -53,9 +43,8 @@ class IceccMonitorClientThread(threading.Thread):
     def _set_state(self, state):
         with self.lock:
             # Only allow increases in state
-            assert (state >= self.state)
-
-            self.state = state
+            if state >= self.state:
+                self.state = state
             self.lock.notifyAll()
 
     def _get_state(self):
@@ -66,7 +55,6 @@ class IceccMonitorClientThread(threading.Thread):
         with self.lock:
             # Never replace an existing, more prior error
             if not self.error:
-                print "setting error", error
                 self.error = error
             if self.state < ConnState.STATE_REQUEST_CLOSE:
                 self.state = ConnState.STATE_REQUEST_CLOSE
@@ -94,32 +82,25 @@ class IceccMonitorClientThread(threading.Thread):
             self._login()
             self._set_state(ConnState.STATE_OPEN)
         except IceccMonConnectionClosed as e:
-            print "connect abort"
             # This means we're in STATE_REQUEST_CLOSE
             pass
         except IceccMonIOError as e:
-            print "got icemon error in connect", e
             self._set_error(e)
         except IOError as e:
-            print "got io error in connect", e
-            # if e.errno == errno.ECONNREFUSED:
             self._set_error(IceccMonConnectionError(e))
 
         while self._get_state() == ConnState.STATE_OPEN:
             try:
-                self._read_data_block()
+                data_block = self._read_data_block()
+                self._enqueue_data_block(data_block)
             except IceccMonConnectionClosed as e:
-                print "read abort"
                 # This means we're in STATE_REQUEST_CLOSE
                 pass
             except IceccMonIOError as e:
-                print "got icemon error", e
                 self._set_error(e)
             except IOError as e:
-                print "got io error", e
                 self._set_error(IceccMonIOError(e))
 
-        print "closing"
         assert (self.state == ConnState.STATE_REQUEST_CLOSE)
         try:
             self.socket.shutdown(socket.SHUT_RDWR)
@@ -128,7 +109,6 @@ class IceccMonitorClientThread(threading.Thread):
             # Ignore failures while closing
             pass
         self._set_state(ConnState.STATE_SOCKET_CLOSED)
-        print "closed"
 
     def _read_bytes(self, num_bytes):
         data = ''
@@ -140,11 +120,9 @@ class IceccMonitorClientThread(threading.Thread):
                 data += chunk
             except socket.timeout:
                 # Just recheck if state has changed
-                print "socket timeout"
                 continue
             except Exception as e:
-                print "other error", e
-                raise
+                raise IceccMonIOError(e)
         if self._get_state() >= ConnState.STATE_REQUEST_CLOSE:
             raise IceccMonConnectionClosed('Connection thread has shut down')
         if len(data) < num_bytes:
@@ -154,6 +132,7 @@ class IceccMonitorClientThread(threading.Thread):
     def _connect(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.connect((self.connection.host, self.connection.port))
+        # This is to be able to check for close requests while reading
         self.socket.settimeout(0.5)
 
     def _login(self):
@@ -187,12 +166,13 @@ class IceccMonitorClientThread(threading.Thread):
         data_block_header = self._read_bytes(4)
         data_block_len = struct.unpack('!L', data_block_header)[0]
         data_block = self._read_bytes(data_block_len)
-        self._enqueue_data_block(data_block)
+        return data_block
 
     def request_connect(self):
-        with self.lock:
-            if self.state < ConnState.STATE_REQUEST_OPEN:
-                self._set_state(ConnState.STATE_REQUEST_OPEN)
+        self._set_state(ConnState.STATE_REQUEST_OPEN)
+
+    def request_close(self):
+        self._set_state(ConnState.STATE_REQUEST_CLOSE)
 
     def wait_for_connect(self, timeout=10):
         end_time = time.time() + timeout
@@ -203,13 +183,7 @@ class IceccMonitorClientThread(threading.Thread):
                     raise IceccMonConnectionError('Connection timed out')
                 self.lock.wait(remaining_time)
             if self.error:
-                print "con ERROR"
                 raise self.error
-
-    def request_close(self):
-        with self.lock:
-            if self.state < ConnState.STATE_REQUEST_CLOSE:
-                self._set_state(ConnState.STATE_REQUEST_CLOSE)
 
     def wait_for_close(self, timeout=5):
         end_time = time.time() + timeout
@@ -233,13 +207,10 @@ class IceccMonitorClientThread(threading.Thread):
         else:
             raise IceccMonTimeout
 
-    def get_next(self, timeout=10):
+    def get_data_block(self, timeout=10):
         end_time = time.time() + timeout
         with self.lock:
             while self.state <= ConnState.STATE_OPEN:
-                if self.error:
-                    raise self.error
-
                 if self.data_blocks:
                     data = self.data_blocks.popleft()
                     return data
@@ -252,7 +223,6 @@ class IceccMonitorClientThread(threading.Thread):
             if self.error:
                 raise self.error
             assert(self.state > ConnState.STATE_OPEN)
-            print "OOPSIE"
             raise IceccMonConnectionClosed('Connection is closed')
 
 
@@ -407,66 +377,53 @@ class ServerMessage(object):
 
 
 class IceccMonitorConnection:
-    def __init__(self, host, port=8765):
+    def __init__(self, host='localhost', port=8765):
         self.host = host
         self.port = port
         self.clientThread = IceccMonitorClientThread(self)
         sct = self.clientThread
 
     def connect(self, timeout=10):
-        print "uj connect"
         self.clientThread.start()
         self.clientThread.request_connect()
         self.clientThread.wait_for_connect(timeout)
-        print "wtf"
-
 
     def get_message(self, block=True, timeout=10):
+        data_block = self.clientThread.get_data_block(timeout)
 
-        print "aj read"
-        data = self.clientThread.get_next(timeout)
-
-        msg_obj = ServerMessage(data)
+        msg_obj = ServerMessage(data_block)
         msg_obj.parse_data()
         msg = msg_obj.values
         return msg
 
     def close(self, timeout=10):
-        print "oj close"
         self.clientThread.request_close()
         return self.clientThread.wait_for_close(timeout)
 
 #------------------------------------------------------------------------------
 if __name__ == "__main__":
 
-    ic = IceccMonitorConnection('localhost')
+    ic = IceccMonitorConnection()
     try:
         ic.connect()
 
         while True:
             try:
                 msg = ic.get_message()
-                print "we got msg:"
                 pprint(msg)
-#                ic.close()
             except IceccMonTimeout as e:
                 print "idle"
                 continue
 
-    except IceccMonError as e2:
-        print e2
-        print type(e2)
-        print "connection transport error2", e2
-
     except IceccMonConnectionError as e:
-        print e
-        print type(e)
-        print "connection time failure", e
+        print "Failure when connecting to server:", e
+
+    except IceccMonIOError as e:
+        print "Server communication error:", e
 
     except KeyboardInterrupt:
-        print "aborting2"
+        print "Aborting"
         pass
 
     finally:
-        print "FINALLY"
         ic.close()
