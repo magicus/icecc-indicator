@@ -290,18 +290,18 @@ class IceccMonitorProtocolHandler:
         msg = DataExtractor(data)
         msg_type = msg.get_int()
         values = {}
-        values['msg_type'] = msg_type
+        values['msgType'] = msg_type
 
         if msg_type == self.M_MON_STATS:
             host_id = msg.get_int()
             payload_str = msg.get_string()
             assert msg.empty()
 
-            values['host_id'] = host_id
+            values['hostId'] = host_id
             for line in payload_str.splitlines():
                 (key, value) = line.split(':', 1)
                 values[key] = value
-            values['msg_desc'] = "Status Update"
+            values['msgDesc'] = "Status Update"
             # Note: State:Offline means this daemon has died and the host_id should be removed.
         elif msg_type == self.M_MON_LOCAL_JOB_BEGIN:
             host_id = msg.get_int()
@@ -310,14 +310,14 @@ class IceccMonitorProtocolHandler:
             file_name = msg.get_string()
             assert msg.empty()
 
-            values.update({'host_id': host_id, 'job_id': job_id, 'start_time': start_time, 'file_name': file_name})
-            values['msg_desc'] = "Local Job Begin"
+            values.update({'hostId': host_id, 'jobId': job_id, 'startTime': start_time, 'filename': file_name})
+            values['msgDesc'] = "Local Job Begin"
         elif msg_type == self.M_JOB_LOCAL_DONE:
             job_id = msg.get_int()
             assert msg.empty()
 
-            values['job_id'] = job_id
-            values['msg_desc'] = "Local Job End"
+            values['jobId'] = job_id
+            values['msgDesc'] = "Local Job End"
         elif msg_type == self.M_MON_GET_CS:
             #    M_MON_GET_CS, S 83 --  MonGetCSMsg(job->id(), submitter->hostId(), m)
             # FIXME
@@ -358,48 +358,47 @@ class IceccMonitorProtocolHandler:
                 #*c << job_id;
                 #*c << clientid;
             #}
-            self.values['msg_desc'] = "Get Compile Server (Request compilation work?)"
+            values['msgDesc'] = "Get Compile Server (Request compilation work?)"
 
         elif msg_type == self.M_MON_JOB_BEGIN:
-            #    M_MON_JOB_BEGIN T 84 -- MonJobBeginMsg(m->job_id, m->stime, cs->hostId())
-            # FIXME
-            #void MonJobBeginMsg::fill_from_channel(MsgChannel *c)
-            #{
-                #Msg::fill_from_channel(c);
-                #*c >> job_id;
-                #*c >> stime;
-                #*c >> hostid;
-            #}
-
-            self.values['msg_desc'] = "Remote Job Begin"
-
-        elif msg_type == self.M_MON_JOB_DONE:
-            #    M_MON_JOB_DONE U 85 -- MonJobDoneMsg(*m) or  MonJobDoneMsg(JobDoneMsg((*jit)->id(),  255)) (when daemon dies)
-            # FIXME
-            #void JobDoneMsg::send_to_channel(MsgChannel *c) const
-            #{
-                #Msg::send_to_channel(c);
-                #*c << job_id;
-                #*c << (uint32_t) exitcode;
-                #*c << real_msec;
-                #*c << user_msec;
-                #*c << sys_msec;
-                #*c << pfaults;
-                #*c << in_compressed;
-                #*c << in_uncompressed;
-                #*c << out_compressed;
-                #*c << out_uncompressed;
-                #*c << flags;
-            #}
-
-            self.values['msg_desc'] = "Remote Job End"
-
-        else:
-            values['hex_dump'] = msg.get_hexdump()
+            job_id = msg.get_int()
+            start_time = msg.get_timestamp()
+            host_id = msg.get_int()
             assert msg.empty()
 
-            values['raw_data'] = data
-            values['msg_desc'] = "Unknown"
+            values.update({'hostId': host_id, 'jobId': job_id, 'startTime': start_time})
+            values['msgDesc'] = "Local Job Begin"
+
+        elif msg_type == self.M_MON_JOB_DONE:
+            job_id = msg.get_int()
+            exitcode = msg.get_int()
+            real_msec = msg.get_int()
+            user_msec = msg.get_int()
+            sys_msec = msg.get_int()
+            pfaults = msg.get_int()
+            in_compressed = msg.get_int()
+            in_uncompressed = msg.get_int()
+            out_compressed = msg.get_int()
+            out_uncompressed = msg.get_int()
+            flags = msg.get_int()
+            assert msg.empty()
+
+            from_submitter = (flags == 1)
+
+            values.update({'jobId': job_id, 'exitcode': exitcode, 'realTimeUsed': real_msec,
+            'userTimeUsed': user_msec, 'systemTimeUsed': sys_msec, 'pageFaults': pfaults,
+            'inputSizeCompressed': in_compressed, 'inputSize': in_uncompressed,
+            'outputSizeCompressed': out_compressed, 'outputSize': out_uncompressed,
+            'fromSubmitter': from_submitter})
+
+            values['msgDesc'] = "Remote Job End"
+
+        else:
+            values['hexDump'] = msg.get_hexdump()
+            assert msg.empty()
+
+            values['rawData'] = data
+            values['msgDesc'] = "Unknown"
             values['error'] = True
 
         return values
