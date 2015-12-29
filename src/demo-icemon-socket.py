@@ -315,18 +315,18 @@ class IceccMonitorProtocolHandler:
         msg = DataExtractor(data)
         msg_type = msg.get_int()
         values = {}
-        values['msgType'] = msg_type
+        values['MsgType'] = msg_type
 
         if msg_type == self.M_MON_STATS:
             host_id = msg.get_int()
             payload_str = msg.get_string()
             assert msg.empty()
 
-            values['hostId'] = host_id
+            values['HostId'] = host_id
             for line in payload_str.splitlines():
                 (key, value) = line.split(':', 1)
                 values[key] = value
-            values['msgDesc'] = "Status Update"
+            values['MsgDesc'] = "Status Update"
             # Note: State:Offline means this daemon has died and the host_id should be removed.
         elif msg_type == self.M_MON_LOCAL_JOB_BEGIN:
             host_id = msg.get_int()
@@ -335,14 +335,14 @@ class IceccMonitorProtocolHandler:
             file_name = msg.get_string()
             assert msg.empty()
 
-            values.update({'hostId': host_id, 'jobId': job_id, 'startTime': start_time, 'filename': file_name})
-            values['msgDesc'] = "Local Job Begin"
+            values.update({'HostId': host_id, 'JobId': job_id, 'StartTime': start_time, 'Filename': file_name})
+            values['MsgDesc'] = "Local Job Begin"
         elif msg_type == self.M_JOB_LOCAL_DONE:
             job_id = msg.get_int()
             assert msg.empty()
 
-            values['jobId'] = job_id
-            values['msgDesc'] = "Local Job End"
+            values['JobId'] = job_id
+            values['MsgDesc'] = "Local Job End"
         elif msg_type == self.M_MON_GET_CS:
             #    M_MON_GET_CS, S 83 --  MonGetCSMsg(job->id(), submitter->hostId(), m)
             # FIXME
@@ -383,7 +383,7 @@ class IceccMonitorProtocolHandler:
                 #*c << job_id;
                 #*c << clientid;
             #}
-            values['msgDesc'] = "Get Compile Server (Request compilation work?)"
+            values['MsgDesc'] = "Get Compile Server (Request compilation work?)"
 
         elif msg_type == self.M_MON_JOB_BEGIN:
             job_id = msg.get_int()
@@ -391,12 +391,12 @@ class IceccMonitorProtocolHandler:
             host_id = msg.get_int()
             assert msg.empty()
 
-            values.update({'hostId': host_id, 'jobId': job_id, 'startTime': start_time})
-            values['msgDesc'] = "Local Job Begin"
+            values.update({'HostId': host_id, 'JobId': job_id, 'StartTime': start_time})
+            values['MsgDesc'] = "Local Job Begin"
 
         elif msg_type == self.M_MON_JOB_DONE:
             job_id = msg.get_int()
-            exitcode = msg.get_int()
+            exit_code = msg.get_int()
             real_msec = msg.get_int()
             user_msec = msg.get_int()
             sys_msec = msg.get_int()
@@ -410,21 +410,21 @@ class IceccMonitorProtocolHandler:
 
             from_submitter = (flags == 1)
 
-            values.update({'jobId': job_id, 'exitcode': exitcode, 'realTimeUsed': real_msec,
-            'userTimeUsed': user_msec, 'systemTimeUsed': sys_msec, 'pageFaults': pfaults,
-            'inputSizeCompressed': in_compressed, 'inputSize': in_uncompressed,
-            'outputSizeCompressed': out_compressed, 'outputSize': out_uncompressed,
-            'fromSubmitter': from_submitter})
+            values.update({'JobId': job_id, 'ExitCode': exit_code, 'RealTimeUsed': real_msec,
+            'UserTimeUsed': user_msec, 'SystemTimeUsed': sys_msec, 'PageFaults': pfaults,
+            'InputSizeCompressed': in_compressed, 'InputSize': in_uncompressed,
+            'OutputSizeCompressed': out_compressed, 'OutputSize': out_uncompressed,
+            'FromSubmitter': from_submitter})
 
-            values['msgDesc'] = "Remote Job End"
+            values['MsgDesc'] = "Remote Job End"
 
         else:
-            values['hexDump'] = msg.get_hexdump()
+            values['HexDump'] = msg.get_hexdump()
             assert msg.empty()
 
-            values['rawData'] = data
-            values['msgDesc'] = "Unknown"
-            values['error'] = True
+            values['RawData'] = data
+            values['MsgDesc'] = "Unknown"
+            values['Error'] = True
 
         return values
 
