@@ -16,6 +16,9 @@ class IceccMonitorError(Exception):
 class IceccMonitorTimeout(IceccMonitorError):
     pass
 
+class IceccMonitorProtocolError(IceccMonitorError):
+    pass
+
 class IceccMonitorIOError(IceccMonitorError):
     pass
 
@@ -33,9 +36,10 @@ class IceccMonitorClient:
         STATE_NEW, STATE_REQUEST_OPEN, STATE_CONNECTING, STATE_CONNECTED, \
             STATE_OPEN, STATE_REQUEST_CLOSE, STATE_SOCKET_CLOSED, STATE_CLOSED = range(8)
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, protocol_handler):
         self.host = host
         self.port = port
+        self.protocol_handler = protocol_handler
         self.socket = None
         self.thread = threading.Thread(target=self._main_loop)
         self.thread.daemon = True
@@ -143,31 +147,19 @@ class IceccMonitorClient:
         self.socket.settimeout(0.5)
 
     def _login(self):
-        # handshake first time
-        # FIXME: adjust protocol version?
-        proto_ver = struct.pack('<L', 32)
+        # We start by sending our maximum supported protocol version
+        self.socket.sendall(self.protocol_handler.get_version_packet())
+        # Server sends their maximum version, and we determine a common version to use
+        version_reply = self._read_bytes(4)
+        self.protocol_handler.negotiate_version(version_reply)
 
-        self.socket.sendall(proto_ver)
+        # Second time around, we make sure we both agree on the selected version
+        self.socket.sendall(self.protocol_handler.get_version_packet())
+        version_reply = self._read_bytes(4)
+        self.protocol_handler.confirm_version(version_reply)
 
-        header_data = self._read_bytes(4)
-        proto_ver2, = struct.unpack('<L', header_data)
-        # FIXME: verify protocol version
-        print "got proto ver 2", proto_ver2
-
-        # handshake second time
-        # FIXME: adjust protocol version?
-        self.socket.sendall(proto_ver)
-
-        header_data = self._read_bytes(4)
-        proto_ver3, = struct.unpack('<L', header_data)
-        # FIXME: verify protocol version
-        print "got proto ver 3", proto_ver3
-
-        # login as monitor
-        login_msg = struct.pack('!L', IceccMonitorProtocolHandler.M_MON_LOGIN)
-
-        header = struct.pack('!L', len(login_msg))
-        self.socket.sendall(header + login_msg)
+        # Login as monitor
+        self.socket.sendall(self.protocol_handler.get_login_packet())
 
     def _read_data_block(self):
         # Data block is assumed to have a four-byte header describing the size
@@ -285,6 +277,39 @@ class IceccMonitorProtocolHandler:
     M_MON_JOB_DONE = 85
     M_MON_LOCAL_JOB_BEGIN = 86
     M_MON_STATS = 87
+
+    PROTOCOL_MAX_VERSION = 34
+    PROTOCOL_MIN_VERSION = 22
+
+    def __init__(self):
+        self.protocol_version = self.PROTOCOL_MAX_VERSION
+
+    def get_login_packet(self):
+        data_block = struct.pack('!L', self.M_MON_LOGIN)
+        data_block_header = struct.pack('!L', len(data_block))
+        return data_block_header + data_block
+
+    def get_version_packet(self):
+        return struct.pack('<L', self.protocol_version)
+
+    def _parse_version_packet(self, data):
+        version, = struct.unpack('<L', data)
+        return version
+
+    def negotiate_version(self, version_packet):
+        other_version = self._parse_version_packet(version_packet)
+        print "received", other_version
+        if other_version < self.PROTOCOL_MIN_VERSION:
+            raise IceccMonitorProtocolError('Server version too old')
+        if other_version < self.PROTOCOL_MAX_VERSION:
+            print "lowering to", other_version
+            self.protocol_version = other_version
+
+    def confirm_version(self, version_packet):
+        other_version = self._parse_version_packet(version_packet)
+        print "received conf", other_version
+        if other_version != self.protocol_version:
+            raise IceccMonitorProtocolError('Server version mismatch')
 
     def parse_data(self, data):
         msg = DataExtractor(data)
@@ -407,8 +432,8 @@ class IceccMonitorProtocolHandler:
 
 class IceccMonitor:
     def __init__(self, host='localhost', port=8765):
-        self.client = IceccMonitorClient(host, port)
         self.protocol_handler = IceccMonitorProtocolHandler()
+        self.client = IceccMonitorClient(host, port, self.protocol_handler)
 
     def connect(self, timeout=30):
         self.client.start_thread()
