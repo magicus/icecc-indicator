@@ -30,16 +30,20 @@ class IceccMonitorConnectionClosed(IceccMonitorIOError):
 class IceccMonitorClient:
     class State:
         # The state always increases and never decreases
-        STATE_NEW, STATE_REQUEST_OPEN, STATE_CONNECTING, STATE_CONNECTED, STATE_OPEN, STATE_REQUEST_CLOSE, STATE_SOCKET_CLOSED, STATE_CLOSED = range(8)
+        STATE_NEW, STATE_REQUEST_OPEN, STATE_CONNECTING, STATE_CONNECTED, \
+            STATE_OPEN, STATE_REQUEST_CLOSE, STATE_SOCKET_CLOSED, STATE_CLOSED = range(8)
 
-    def __init__(self, connection):
-        self.connection = connection
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
         self.socket = None
         self.thread = threading.Thread(target=self._main_loop)
         self.thread.daemon = True
 
         self.lock = threading.Condition()
         # Variables protected by the lock. All changes to these are notified on the lock.
+        # If an error is set, the state is at least STATE_REQUEST_CLOSE.
+        # If state is at least STATE_OPEN, data_blocks can contain data.
         self.state = self.State.STATE_NEW
         self.data_blocks = deque()
         self.error = None
@@ -66,7 +70,7 @@ class IceccMonitorClient:
 
     def _enqueue_data_block(self, data):
         with self.lock:
-            assert (self.state == self.State.STATE_OPEN)
+            assert self.state == self.State.STATE_OPEN
             self.data_blocks.append(data)
             self.lock.notifyAll()
 
@@ -76,22 +80,21 @@ class IceccMonitorClient:
             while self.state < self.State.STATE_REQUEST_OPEN:
                 self.lock.wait()
 
-            assert(self.state == self.State.STATE_REQUEST_OPEN)
+        if self.state == self.State.STATE_REQUEST_OPEN:
+            # Connect requested
             self._set_state(self.State.STATE_CONNECTING)
-
-        # Connect requested
-        try:
-            self._connect()
-            self._set_state(self.State.STATE_CONNECTED)
-            self._login()
-            self._set_state(self.State.STATE_OPEN)
-        except IceccMonitorConnectionClosed as e:
-            # This means we're in STATE_REQUEST_CLOSE
-            pass
-        except IceccMonitorIOError as e:
-            self._set_error(e)
-        except Exception as e:
-            self._set_error(IceccMonitorConnectionError(e))
+            try:
+                self._connect()
+                self._set_state(self.State.STATE_CONNECTED)
+                self._login()
+                self._set_state(self.State.STATE_OPEN)
+            except IceccMonitorConnectionClosed as e:
+                # This means we're in STATE_REQUEST_CLOSE
+                pass
+            except IceccMonitorIOError as e:
+                self._set_error(e)
+            except Exception as e:
+                self._set_error(IceccMonitorConnectionError(e))
 
         while self._get_state() == self.State.STATE_OPEN:
             try:
@@ -105,7 +108,7 @@ class IceccMonitorClient:
             except Exception as e:
                 self._set_error(IceccMonitorIOError(e))
 
-        assert (self.state == self.State.STATE_REQUEST_CLOSE)
+        assert self.state == self.State.STATE_REQUEST_CLOSE
         try:
             self.socket.shutdown(socket.SHUT_RDWR)
             self.socket.close()
@@ -135,7 +138,7 @@ class IceccMonitorClient:
 
     def _connect(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.connect((self.connection.host, self.connection.port))
+        self.socket.connect((self.host, self.port))
         # This is to be able to check for close requests while reading
         self.socket.settimeout(0.5)
 
@@ -147,7 +150,7 @@ class IceccMonitorClient:
         self.socket.sendall(proto_ver)
 
         header_data = self._read_bytes(4)
-        proto_ver2 = struct.unpack('<L', header_data)[0]
+        proto_ver2, = struct.unpack('<L', header_data)
         # FIXME: verify protocol version
         print "got proto ver 2", proto_ver2
 
@@ -156,7 +159,7 @@ class IceccMonitorClient:
         self.socket.sendall(proto_ver)
 
         header_data = self._read_bytes(4)
-        proto_ver3 = struct.unpack('<L', header_data)[0]
+        proto_ver3, = struct.unpack('<L', header_data)
         # FIXME: verify protocol version
         print "got proto ver 3", proto_ver3
 
@@ -167,8 +170,10 @@ class IceccMonitorClient:
         self.socket.sendall(header + login_msg)
 
     def _read_data_block(self):
+        # Data block is assumed to have a four-byte header describing the size
+        # of the remaining data (in network byte order)
         data_block_header = self._read_bytes(4)
-        data_block_len = struct.unpack('!L', data_block_header)[0]
+        data_block_len, = struct.unpack('!L', data_block_header)
         data_block = self._read_bytes(data_block_len)
         return data_block
 
@@ -236,7 +241,7 @@ class IceccMonitorClient:
 
             if self.error:
                 raise self.error
-            assert(self.state > self.State.STATE_OPEN)
+            assert self.state > self.State.STATE_OPEN
             raise IceccMonitorConnectionClosed('Connection is closed')
 
 ################################################################################
@@ -396,24 +401,22 @@ class IceccMonitorMessageParser(object):
 
 class IceccMonitor:
     def __init__(self, host='localhost', port=8765):
-        self.host = host
-        self.port = port
-        self.clientThread = IceccMonitorClient(self)
+        self.client = IceccMonitorClient(host, port)
 
     def connect(self, timeout=30):
-        self.clientThread.start_thread()
-        self.clientThread.request_connect()
-        self.clientThread.wait_for_connect(timeout)
+        self.client.start_thread()
+        self.client.request_connect()
+        self.client.wait_for_connect(timeout)
 
     def get_message(self, block=True, timeout=0):
-        data_block = self.clientThread.get_data_block(block, timeout)
+        data_block = self.client.get_data_block(block, timeout)
         parser = IceccMonitorMessageParser(data_block)
         msg = parser.parse_data()
         return msg
 
     def close(self, timeout=10):
-        self.clientThread.request_close()
-        return self.clientThread.wait_for_close(timeout)
+        self.client.request_close()
+        return self.client.wait_for_close(timeout)
 
 ################################################################################
 
