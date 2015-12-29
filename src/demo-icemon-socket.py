@@ -27,19 +27,20 @@ class IceccMonitorConnectionClosed(IceccMonitorIOError):
 
 ################################################################################
 
-class IceccMonitorClientThread(threading.Thread):
-    class ConnectionState:
+class IceccMonitorClient:
+    class State:
         # The state always increases and never decreases
         STATE_NEW, STATE_REQUEST_OPEN, STATE_CONNECTING, STATE_CONNECTED, STATE_OPEN, STATE_REQUEST_CLOSE, STATE_SOCKET_CLOSED, STATE_CLOSED = range(8)
 
     def __init__(self, connection):
-        super(IceccMonitorClientThread, self).__init__()
         self.connection = connection
         self.socket = None
+        self.thread = threading.Thread(target=self._main_loop)
+        self.thread.daemon = True
 
         self.lock = threading.Condition()
         # Variables protected by the lock. All changes to these are notified on the lock.
-        self.state = self.ConnectionState.STATE_NEW
+        self.state = self.State.STATE_NEW
         self.data_blocks = deque()
         self.error = None
 
@@ -59,31 +60,31 @@ class IceccMonitorClientThread(threading.Thread):
             # Never replace an existing, more prior error
             if not self.error:
                 self.error = error
-            if self.state < self.ConnectionState.STATE_REQUEST_CLOSE:
-                self.state = self.ConnectionState.STATE_REQUEST_CLOSE
+            if self.state < self.State.STATE_REQUEST_CLOSE:
+                self.state = self.State.STATE_REQUEST_CLOSE
             self.lock.notifyAll()
 
     def _enqueue_data_block(self, data):
         with self.lock:
-            assert (self.state == self.ConnectionState.STATE_OPEN)
+            assert (self.state == self.State.STATE_OPEN)
             self.data_blocks.append(data)
             self.lock.notifyAll()
 
-    def run(self):
+    def _main_loop(self):
         # Wait for request to connect
         with self.lock:
-            while self.state < self.ConnectionState.STATE_REQUEST_OPEN:
+            while self.state < self.State.STATE_REQUEST_OPEN:
                 self.lock.wait()
 
-            assert(self.state == self.ConnectionState.STATE_REQUEST_OPEN)
-            self._set_state(self.ConnectionState.STATE_CONNECTING)
+            assert(self.state == self.State.STATE_REQUEST_OPEN)
+            self._set_state(self.State.STATE_CONNECTING)
 
         # Connect requested
         try:
             self._connect()
-            self._set_state(self.ConnectionState.STATE_CONNECTED)
+            self._set_state(self.State.STATE_CONNECTED)
             self._login()
-            self._set_state(self.ConnectionState.STATE_OPEN)
+            self._set_state(self.State.STATE_OPEN)
         except IceccMonitorConnectionClosed as e:
             # This means we're in STATE_REQUEST_CLOSE
             pass
@@ -92,7 +93,7 @@ class IceccMonitorClientThread(threading.Thread):
         except Exception as e:
             self._set_error(IceccMonitorConnectionError(e))
 
-        while self._get_state() == self.ConnectionState.STATE_OPEN:
+        while self._get_state() == self.State.STATE_OPEN:
             try:
                 data_block = self._read_data_block()
                 self._enqueue_data_block(data_block)
@@ -104,18 +105,18 @@ class IceccMonitorClientThread(threading.Thread):
             except Exception as e:
                 self._set_error(IceccMonitorIOError(e))
 
-        assert (self.state == self.ConnectionState.STATE_REQUEST_CLOSE)
+        assert (self.state == self.State.STATE_REQUEST_CLOSE)
         try:
             self.socket.shutdown(socket.SHUT_RDWR)
             self.socket.close()
         except:
             # Ignore failures while closing
             pass
-        self._set_state(self.ConnectionState.STATE_SOCKET_CLOSED)
+        self._set_state(self.State.STATE_SOCKET_CLOSED)
 
     def _read_bytes(self, num_bytes):
         data = ''
-        while self._get_state() <= self.ConnectionState.STATE_OPEN and len(data) < num_bytes:
+        while self._get_state() <= self.State.STATE_OPEN and len(data) < num_bytes:
             try:
                 chunk = self.socket.recv(num_bytes - len(data))
                 if chunk == '':
@@ -126,7 +127,7 @@ class IceccMonitorClientThread(threading.Thread):
                 continue
             except Exception as e:
                 raise IceccMonitorIOError(e)
-        if self._get_state() >= self.ConnectionState.STATE_REQUEST_CLOSE:
+        if self._get_state() >= self.State.STATE_REQUEST_CLOSE:
             raise IceccMonitorConnectionClosed('Connection thread has shut down')
         if len(data) < num_bytes:
             raise IceccMonitorIOError('Connection closed by server')
@@ -171,16 +172,19 @@ class IceccMonitorClientThread(threading.Thread):
         data_block = self._read_bytes(data_block_len)
         return data_block
 
+    def start_thread(self):
+        self.thread.start()
+
     def request_connect(self):
-        self._set_state(self.ConnectionState.STATE_REQUEST_OPEN)
+        self._set_state(self.State.STATE_REQUEST_OPEN)
 
     def request_close(self):
-        self._set_state(self.ConnectionState.STATE_REQUEST_CLOSE)
+        self._set_state(self.State.STATE_REQUEST_CLOSE)
 
     def wait_for_connect(self, timeout):
         end_time = time.time() + timeout
         with self.lock:
-            while self.state < self.ConnectionState.STATE_OPEN:
+            while self.state < self.State.STATE_OPEN:
                 remaining_time = end_time - time.time()
                 if remaining_time <= 0:
                     raise IceccMonitorConnectionError('Connection timed out')
@@ -191,7 +195,7 @@ class IceccMonitorClientThread(threading.Thread):
     def wait_for_close(self, timeout):
         end_time = time.time() + timeout
         with self.lock:
-            while self.state < self.ConnectionState.STATE_SOCKET_CLOSED:
+            while self.state < self.State.STATE_SOCKET_CLOSED:
                 if self.error:
                     # At this point, we really don't care about IOErrors
                     return False
@@ -204,16 +208,16 @@ class IceccMonitorClientThread(threading.Thread):
         if remaining_time <= 0:
             # Even if we're out of time, give us the chance to join properly
             remaining_time = 0.1
-        threading.Thread.join(self, remaining_time)
-        if not self.is_alive():
-            self._set_state(self.ConnectionState.STATE_CLOSED)
+        self.thread.join(remaining_time)
+        if not self.thread.is_alive():
+            self._set_state(self.State.STATE_CLOSED)
         else:
             raise IceccMonitorTimeout
 
     def get_data_block(self, block, timeout):
         end_time = time.time() + timeout
         with self.lock:
-            while self.state <= self.ConnectionState.STATE_OPEN:
+            while self.state <= self.State.STATE_OPEN:
                 if self.data_blocks:
                     data = self.data_blocks.popleft()
                     return data
@@ -232,7 +236,7 @@ class IceccMonitorClientThread(threading.Thread):
 
             if self.error:
                 raise self.error
-            assert(self.state > self.ConnectionState.STATE_OPEN)
+            assert(self.state > self.State.STATE_OPEN)
             raise IceccMonitorConnectionClosed('Connection is closed')
 
 ################################################################################
@@ -394,10 +398,10 @@ class IceccMonitor:
     def __init__(self, host='localhost', port=8765):
         self.host = host
         self.port = port
-        self.clientThread = IceccMonitorClientThread(self)
+        self.clientThread = IceccMonitorClient(self)
 
     def connect(self, timeout=30):
-        self.clientThread.start()
+        self.clientThread.start_thread()
         self.clientThread.request_connect()
         self.clientThread.wait_for_connect(timeout)
 
