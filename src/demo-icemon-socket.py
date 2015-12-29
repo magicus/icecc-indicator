@@ -5,30 +5,33 @@ import errno
 import struct
 import threading
 import time
-from pprint import pprint
 from datetime import datetime
 from collections import deque
 
-class IceccMonError(Exception):
+################################################################################
+
+class IceccMonitorError(Exception):
     pass
 
-class IceccMonTimeout(IceccMonError):
+class IceccMonitorTimeout(IceccMonitorError):
     pass
 
-class IceccMonIOError(IceccMonError):
+class IceccMonitorIOError(IceccMonitorError):
     pass
 
-class IceccMonConnectionError(IceccMonIOError):
+class IceccMonitorConnectionError(IceccMonitorIOError):
     pass
 
-class IceccMonConnectionClosed(IceccMonIOError):
+class IceccMonitorConnectionClosed(IceccMonitorIOError):
     pass
 
-class ConnState:
-    # The state always increases and never decreases
-    STATE_NEW, STATE_REQUEST_OPEN, STATE_CONNECTING, STATE_CONNECTED, STATE_OPEN, STATE_REQUEST_CLOSE, STATE_SOCKET_CLOSED, STATE_CLOSED = range(8)
+################################################################################
 
 class IceccMonitorClientThread(threading.Thread):
+    class ConnectionState:
+        # The state always increases and never decreases
+        STATE_NEW, STATE_REQUEST_OPEN, STATE_CONNECTING, STATE_CONNECTED, STATE_OPEN, STATE_REQUEST_CLOSE, STATE_SOCKET_CLOSED, STATE_CLOSED = range(8)
+
     def __init__(self, connection):
         super(IceccMonitorClientThread, self).__init__()
         self.connection = connection
@@ -36,7 +39,7 @@ class IceccMonitorClientThread(threading.Thread):
 
         self.lock = threading.Condition()
         # Variables protected by the lock. All changes to these are notified on the lock.
-        self.state = ConnState.STATE_NEW
+        self.state = self.ConnectionState.STATE_NEW
         self.data_blocks = deque()
         self.error = None
 
@@ -56,63 +59,63 @@ class IceccMonitorClientThread(threading.Thread):
             # Never replace an existing, more prior error
             if not self.error:
                 self.error = error
-            if self.state < ConnState.STATE_REQUEST_CLOSE:
-                self.state = ConnState.STATE_REQUEST_CLOSE
+            if self.state < self.ConnectionState.STATE_REQUEST_CLOSE:
+                self.state = self.ConnectionState.STATE_REQUEST_CLOSE
             self.lock.notifyAll()
 
     def _enqueue_data_block(self, data):
         with self.lock:
-            assert (self.state == ConnState.STATE_OPEN)
+            assert (self.state == self.ConnectionState.STATE_OPEN)
             self.data_blocks.append(data)
             self.lock.notifyAll()
 
     def run(self):
         # Wait for request to connect
         with self.lock:
-            while self.state < ConnState.STATE_REQUEST_OPEN:
+            while self.state < self.ConnectionState.STATE_REQUEST_OPEN:
                 self.lock.wait()
 
-            assert(self.state == ConnState.STATE_REQUEST_OPEN)
-            self._set_state(ConnState.STATE_CONNECTING)
+            assert(self.state == self.ConnectionState.STATE_REQUEST_OPEN)
+            self._set_state(self.ConnectionState.STATE_CONNECTING)
 
         # Connect requested
         try:
             self._connect()
-            self._set_state(ConnState.STATE_CONNECTED)
+            self._set_state(self.ConnectionState.STATE_CONNECTED)
             self._login()
-            self._set_state(ConnState.STATE_OPEN)
-        except IceccMonConnectionClosed as e:
+            self._set_state(self.ConnectionState.STATE_OPEN)
+        except IceccMonitorConnectionClosed as e:
             # This means we're in STATE_REQUEST_CLOSE
             pass
-        except IceccMonIOError as e:
+        except IceccMonitorIOError as e:
             self._set_error(e)
-        except IOError as e:
-            self._set_error(IceccMonConnectionError(e))
+        except Exception as e:
+            self._set_error(IceccMonitorConnectionError(e))
 
-        while self._get_state() == ConnState.STATE_OPEN:
+        while self._get_state() == self.ConnectionState.STATE_OPEN:
             try:
                 data_block = self._read_data_block()
                 self._enqueue_data_block(data_block)
-            except IceccMonConnectionClosed as e:
+            except IceccMonitorConnectionClosed as e:
                 # This means we're in STATE_REQUEST_CLOSE
                 pass
-            except IceccMonIOError as e:
+            except IceccMonitorIOError as e:
                 self._set_error(e)
-            except IOError as e:
-                self._set_error(IceccMonIOError(e))
+            except Exception as e:
+                self._set_error(IceccMonitorIOError(e))
 
-        assert (self.state == ConnState.STATE_REQUEST_CLOSE)
+        assert (self.state == self.ConnectionState.STATE_REQUEST_CLOSE)
         try:
             self.socket.shutdown(socket.SHUT_RDWR)
             self.socket.close()
         except:
             # Ignore failures while closing
             pass
-        self._set_state(ConnState.STATE_SOCKET_CLOSED)
+        self._set_state(self.ConnectionState.STATE_SOCKET_CLOSED)
 
     def _read_bytes(self, num_bytes):
         data = ''
-        while self._get_state() <= ConnState.STATE_OPEN and len(data) < num_bytes:
+        while self._get_state() <= self.ConnectionState.STATE_OPEN and len(data) < num_bytes:
             try:
                 chunk = self.socket.recv(num_bytes - len(data))
                 if chunk == '':
@@ -122,11 +125,11 @@ class IceccMonitorClientThread(threading.Thread):
                 # Just recheck if state has changed
                 continue
             except Exception as e:
-                raise IceccMonIOError(e)
-        if self._get_state() >= ConnState.STATE_REQUEST_CLOSE:
-            raise IceccMonConnectionClosed('Connection thread has shut down')
+                raise IceccMonitorIOError(e)
+        if self._get_state() >= self.ConnectionState.STATE_REQUEST_CLOSE:
+            raise IceccMonitorConnectionClosed('Connection thread has shut down')
         if len(data) < num_bytes:
-            raise IceccMonIOError('Connection closed by server')
+            raise IceccMonitorIOError('Connection closed by server')
         return data
 
     def _connect(self):
@@ -157,7 +160,7 @@ class IceccMonitorClientThread(threading.Thread):
         print "got proto ver 3", proto_ver3
 
         # login as monitor
-        login_msg = struct.pack('!L', ServerMessage.M_MON_LOGIN)
+        login_msg = struct.pack('!L', IceccMonitorMessageParser.M_MON_LOGIN)
 
         header = struct.pack('!L', len(login_msg))
         self.socket.sendall(header + login_msg)
@@ -169,32 +172,32 @@ class IceccMonitorClientThread(threading.Thread):
         return data_block
 
     def request_connect(self):
-        self._set_state(ConnState.STATE_REQUEST_OPEN)
+        self._set_state(self.ConnectionState.STATE_REQUEST_OPEN)
 
     def request_close(self):
-        self._set_state(ConnState.STATE_REQUEST_CLOSE)
+        self._set_state(self.ConnectionState.STATE_REQUEST_CLOSE)
 
-    def wait_for_connect(self, timeout=10):
+    def wait_for_connect(self, timeout):
         end_time = time.time() + timeout
         with self.lock:
-            while self.state < ConnState.STATE_OPEN:
+            while self.state < self.ConnectionState.STATE_OPEN:
                 remaining_time = end_time - time.time()
                 if remaining_time <= 0:
-                    raise IceccMonConnectionError('Connection timed out')
+                    raise IceccMonitorConnectionError('Connection timed out')
                 self.lock.wait(remaining_time)
             if self.error:
                 raise self.error
 
-    def wait_for_close(self, timeout=5):
+    def wait_for_close(self, timeout):
         end_time = time.time() + timeout
         with self.lock:
-            while self.state < ConnState.STATE_SOCKET_CLOSED:
+            while self.state < self.ConnectionState.STATE_SOCKET_CLOSED:
                 if self.error:
                     # At this point, we really don't care about IOErrors
                     return False
                 remaining_time = end_time - time.time()
                 if remaining_time <= 0:
-                    raise IceccMonTimeout
+                    raise IceccMonitorTimeout
                 self.lock.wait(remaining_time)
 
         remaining_time = end_time - time.time()
@@ -203,30 +206,38 @@ class IceccMonitorClientThread(threading.Thread):
             remaining_time = 0.1
         threading.Thread.join(self, remaining_time)
         if not self.is_alive():
-            self._set_state(ConnState.STATE_CLOSED)
+            self._set_state(self.ConnectionState.STATE_CLOSED)
         else:
-            raise IceccMonTimeout
+            raise IceccMonitorTimeout
 
-    def get_data_block(self, timeout=10):
+    def get_data_block(self, block, timeout):
         end_time = time.time() + timeout
         with self.lock:
-            while self.state <= ConnState.STATE_OPEN:
+            while self.state <= self.ConnectionState.STATE_OPEN:
                 if self.data_blocks:
                     data = self.data_blocks.popleft()
                     return data
+                if not block:
+                    return None
 
-                remaining_time = end_time - time.time()
-                if remaining_time <= 0:
-                    raise IceccMonTimeout
+                if timeout > 0:
+                    remaining_time = end_time - time.time()
+                    if remaining_time <= 0:
+                        raise IceccMonitorTimeout
+                else:
+                    # block==False and timeout=0 means wait indefinitely
+                    # However, wait(None) will disable KeyboardInterrupt.
+                    remaining_time = 60
                 self.lock.wait(remaining_time)
 
             if self.error:
                 raise self.error
-            assert(self.state > ConnState.STATE_OPEN)
-            raise IceccMonConnectionClosed('Connection is closed')
+            assert(self.state > self.ConnectionState.STATE_OPEN)
+            raise IceccMonitorConnectionClosed('Connection is closed')
 
+################################################################################
 
-class ServerMessage(object):
+class IceccMonitorMessageParser(object):
     M_JOB_LOCAL_DONE = 79
     M_MON_LOGIN = 82
     M_MON_GET_CS = 83
@@ -264,7 +275,7 @@ class ServerMessage(object):
         msg_type = msg.get_int()
         self.values['msg_type'] = msg_type
 
-        if msg_type == ServerMessage.M_MON_STATS:
+        if msg_type == IceccMonitorMessageParser.M_MON_STATS:
             host_id = msg.get_int()
             payload_str = msg.get_string()
             assert msg.empty()
@@ -275,7 +286,7 @@ class ServerMessage(object):
                 self.values[key] = value
             self.values['msg_desc'] = "Status Update"
             # Note: State:Offline means this daemon has died and the host_id should be removed.
-        elif msg_type == ServerMessage.M_MON_LOCAL_JOB_BEGIN:
+        elif msg_type == IceccMonitorMessageParser.M_MON_LOCAL_JOB_BEGIN:
             host_id = msg.get_int()
             job_id = msg.get_int()
             start_time = msg.get_timestamp()
@@ -284,13 +295,13 @@ class ServerMessage(object):
 
             self.values.update({'host_id': host_id, 'job_id': job_id, 'start_time': start_time, 'file_name': file_name})
             self.values['msg_desc'] = "Local Job Begin"
-        elif msg_type == ServerMessage.M_JOB_LOCAL_DONE:
+        elif msg_type == IceccMonitorMessageParser.M_JOB_LOCAL_DONE:
             job_id = msg.get_int()
             assert msg.empty()
 
             self.values['job_id'] = job_id
             self.values['msg_desc'] = "Local Job End"
-        elif msg_type == ServerMessage.M_MON_GET_CS:
+        elif msg_type == IceccMonitorMessageParser.M_MON_GET_CS:
             #    M_MON_GET_CS, S 83 --  MonGetCSMsg(job->id(), submitter->hostId(), m)
             # FIXME
 
@@ -332,7 +343,7 @@ class ServerMessage(object):
             #}
             self.values['msg_desc'] = "Get Compile Server (Request compilation work?)"
 
-        elif msg_type == ServerMessage.M_MON_JOB_BEGIN:
+        elif msg_type == IceccMonitorMessageParser.M_MON_JOB_BEGIN:
             #    M_MON_JOB_BEGIN T 84 -- MonJobBeginMsg(m->job_id, m->stime, cs->hostId())
             # FIXME
             #void MonJobBeginMsg::fill_from_channel(MsgChannel *c)
@@ -345,7 +356,7 @@ class ServerMessage(object):
 
             self.values['msg_desc'] = "Remote Job Begin"
 
-        elif msg_type == ServerMessage.M_MON_JOB_DONE:
+        elif msg_type == IceccMonitorMessageParser.M_MON_JOB_DONE:
             #    M_MON_JOB_DONE U 85 -- MonJobDoneMsg(*m) or  MonJobDoneMsg(JobDoneMsg((*jit)->id(),  255)) (when daemon dies)
             # FIXME
             #void JobDoneMsg::send_to_channel(MsgChannel *c) const
@@ -375,50 +386,47 @@ class ServerMessage(object):
             self.values['error'] = True
             self.values['payload'] = reply.data
 
+        return self.values
 
-class IceccMonitorConnection:
+################################################################################
+
+class IceccMonitor:
     def __init__(self, host='localhost', port=8765):
         self.host = host
         self.port = port
         self.clientThread = IceccMonitorClientThread(self)
-        sct = self.clientThread
 
-    def connect(self, timeout=10):
+    def connect(self, timeout=30):
         self.clientThread.start()
         self.clientThread.request_connect()
         self.clientThread.wait_for_connect(timeout)
 
-    def get_message(self, block=True, timeout=10):
-        data_block = self.clientThread.get_data_block(timeout)
-
-        msg_obj = ServerMessage(data_block)
-        msg_obj.parse_data()
-        msg = msg_obj.values
+    def get_message(self, block=True, timeout=0):
+        data_block = self.clientThread.get_data_block(block, timeout)
+        parser = IceccMonitorMessageParser(data_block)
+        msg = parser.parse_data()
         return msg
 
     def close(self, timeout=10):
         self.clientThread.request_close()
         return self.clientThread.wait_for_close(timeout)
 
-#------------------------------------------------------------------------------
-if __name__ == "__main__":
+################################################################################
 
-    ic = IceccMonitorConnection()
+if __name__ == "__main__":
+    # When run as main program, just dump incoming messages to stdout
+    ic = IceccMonitor()
     try:
         ic.connect()
 
         while True:
-            try:
-                msg = ic.get_message()
-                pprint(msg)
-            except IceccMonTimeout as e:
-                print "idle"
-                continue
+            msg = ic.get_message()
+            print(msg)
 
-    except IceccMonConnectionError as e:
+    except IceccMonitorConnectionError as e:
         print "Failure when connecting to server:", e
 
-    except IceccMonIOError as e:
+    except IceccMonitorIOError as e:
         print "Server communication error:", e
 
     except KeyboardInterrupt:
