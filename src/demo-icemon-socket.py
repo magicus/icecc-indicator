@@ -279,7 +279,7 @@ class IceccMonitorProtocolHandler:
     M_MON_STATS = 87
 
     PROTOCOL_MAX_VERSION = 34
-    PROTOCOL_MIN_VERSION = 22
+    PROTOCOL_MIN_VERSION = 29
 
     def __init__(self):
         self.protocol_version = self.PROTOCOL_MAX_VERSION
@@ -298,16 +298,13 @@ class IceccMonitorProtocolHandler:
 
     def negotiate_version(self, version_packet):
         other_version = self._parse_version_packet(version_packet)
-        print "received", other_version
         if other_version < self.PROTOCOL_MIN_VERSION:
             raise IceccMonitorProtocolError('Server version too old')
         if other_version < self.PROTOCOL_MAX_VERSION:
-            print "lowering to", other_version
             self.protocol_version = other_version
 
     def confirm_version(self, version_packet):
         other_version = self._parse_version_packet(version_packet)
-        print "received conf", other_version
         if other_version != self.protocol_version:
             raise IceccMonitorProtocolError('Server version mismatch')
 
@@ -315,75 +312,52 @@ class IceccMonitorProtocolHandler:
         msg = DataExtractor(data)
         msg_type = msg.get_int()
         values = {}
-        values['MsgType'] = msg_type
+        values['MsgTypeId'] = msg_type
 
         if msg_type == self.M_MON_STATS:
             host_id = msg.get_int()
-            payload_str = msg.get_string()
+            status_str = msg.get_string()
             assert msg.empty()
 
             values['HostId'] = host_id
-            for line in payload_str.splitlines():
+            for line in status_str.splitlines():
                 (key, value) = line.split(':', 1)
                 values[key] = value
-            values['MsgDesc'] = "Status Update"
+            values['MsgType'] = "StatusUpdate"
             # Note: State:Offline means this daemon has died and the host_id should be removed.
+
         elif msg_type == self.M_MON_LOCAL_JOB_BEGIN:
             host_id = msg.get_int()
             job_id = msg.get_int()
             start_time = msg.get_timestamp()
-            file_name = msg.get_string()
+            filename = msg.get_string()
             assert msg.empty()
 
-            values.update({'HostId': host_id, 'JobId': job_id, 'StartTime': start_time, 'Filename': file_name})
-            values['MsgDesc'] = "Local Job Begin"
+            values.update({'HostId': host_id, 'JobId': job_id, 'StartTime': start_time, 'Filename': filename})
+            values['MsgType'] = "LocalJobBegin"
+
         elif msg_type == self.M_JOB_LOCAL_DONE:
             job_id = msg.get_int()
             assert msg.empty()
 
             values['JobId'] = job_id
-            values['MsgDesc'] = "Local Job End"
+            values['MsgType'] = "LocalJobEnd"
+
         elif msg_type == self.M_MON_GET_CS:
-            #    M_MON_GET_CS, S 83 --  MonGetCSMsg(job->id(), submitter->hostId(), m)
-            # FIXME
+            filename = msg.get_string()
+            lang_id = msg.get_int()
+            job_id = msg.get_int()
+            host_id = msg.get_int()
+            assert msg.empty()
 
-            #void GetCSMsg::send_to_channel(MsgChannel *c) const
-            #{
-                #Msg::send_to_channel(c);
-                #c->write_environments(versions);
-                #*c << shorten_filename(filename);
-                #*c << (uint32_t) lang;
-                #*c << count;
-                #*c << target;
-                #*c << arg_flags;
-                #*c << client_id;
+            languages = ['C', 'C++', 'ObjC', '<custom>']
+            try:
+                language = languages[lang_id]
+            except IndexError:
+                language = '<unknown>'
 
-                #if (IS_PROTOCOL_22(c)) {
-                    #*c << preferred_host;
-                #}
-
-                #if (IS_PROTOCOL_31(c)) {
-                    #*c << uint32_t(minimal_host_version >= 31 ? 1 : 0);
-                #}
-                #if (IS_PROTOCOL_34(c)) {
-                    #*c << minimal_host_version;
-                #}
-            #}
-
-            #void MonGetCSMsg::send_to_channel(MsgChannel *c) const
-            #{
-                #if (IS_PROTOCOL_29(c)) {
-                    #Msg::send_to_channel(c);
-                    #*c << shorten_filename(filename);
-                    #*c << (uint32_t) lang;
-                #} else {
-                    #GetCSMsg::send_to_channel(c);
-                #}
-
-                #*c << job_id;
-                #*c << clientid;
-            #}
-            values['MsgDesc'] = "Get Compile Server (Request compilation work?)"
+            values.update({'HostId': host_id, 'JobId': job_id, 'Language': language, 'Filename': filename})
+            values['MsgType'] = "CompilationRequest"
 
         elif msg_type == self.M_MON_JOB_BEGIN:
             job_id = msg.get_int()
@@ -392,7 +366,7 @@ class IceccMonitorProtocolHandler:
             assert msg.empty()
 
             values.update({'HostId': host_id, 'JobId': job_id, 'StartTime': start_time})
-            values['MsgDesc'] = "Local Job Begin"
+            values['MsgType'] = "LocalJobBegin"
 
         elif msg_type == self.M_MON_JOB_DONE:
             job_id = msg.get_int()
@@ -415,15 +389,14 @@ class IceccMonitorProtocolHandler:
             'InputSizeCompressed': in_compressed, 'InputSize': in_uncompressed,
             'OutputSizeCompressed': out_compressed, 'OutputSize': out_uncompressed,
             'FromSubmitter': from_submitter})
-
-            values['MsgDesc'] = "Remote Job End"
+            values['MsgType'] = "RemoteJobEnd"
 
         else:
             values['HexDump'] = msg.get_hexdump()
             assert msg.empty()
 
             values['RawData'] = data
-            values['MsgDesc'] = "Unknown"
+            values['MsgType'] = "UnknownMessageType"
             values['Error'] = True
 
         return values
